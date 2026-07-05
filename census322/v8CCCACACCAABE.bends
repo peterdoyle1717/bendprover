@@ -1,0 +1,21 @@
+CLERS CCCACACCAABE
+CERT PASS sigma_low - h - radius -
+TURNING min_nonflat 6.283185307 flats_exact_zero 2
+EDGE 1 1 2 tau/2
+EDGE 2 2 3 0
+EDGE 3 1 3 0
+EDGE 4 3 4 0
+EDGE 5 1 4 tau/2
+EDGE 6 4 5 0
+EDGE 7 1 5 0
+EDGE 8 2 5 0
+EDGE 9 5 6 0
+EDGE 10 2 6 tau/2
+EDGE 11 3 6 0
+EDGE 12 6 7 tau/2
+EDGE 13 3 7 0
+EDGE 14 7 8 tau/2
+EDGE 15 3 8 0
+EDGE 16 4 8 tau/2
+EDGE 17 5 8 0
+EDGE 18 5 7 0

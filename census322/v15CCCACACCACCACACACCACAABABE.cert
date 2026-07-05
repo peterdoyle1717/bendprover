@@ -1,0 +1,11 @@
+{
+ "ok": true,
+ "pancake": true,
+ "F": 0,
+ "why": "pancake: every edge 0 or tau/2; degenerate flat object, special-cased",
+ "turning": {
+  "min_nonflat": 6.283185307,
+  "nflatv": 6
+ },
+ "develop_spread": 2.5171801064088586e-15
+}
