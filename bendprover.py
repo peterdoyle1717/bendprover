@@ -100,6 +100,7 @@ def process(clers, seedpath, outdir, clers_bin="clers"):
                         why='pancake: every edge 0 or tau/2; degenerate flat object, special-cased')
         tr = turning_report(stars, flats, bends_f)
         cert['turning'] = tr
+        cert['neoconvex'] = (tr['min_nonflat'] is not None and tr['min_nonflat'] > 1e-12)
         netio.write_bends(stem + ".bends", clers or "?", eab, flats,
                           {e: ("tau/2" if e in pis else bends_s[e])
                            for e in eab if e not in flats}, cert, tr)
@@ -133,6 +134,15 @@ def process(clers, seedpath, outdir, clers_bin="clers"):
         bends_exact = {e: (0.0 if e in flats else bends_f[e]) for e in eab}
     tr = turning_report(stars, flats, bends_exact)
     cert['turning'] = tr
+    # neoconvexity gate (the lm_solve dent gate's final-state analogue):
+    # the certified solution must have positive total turning at every
+    # non-flat vertex.  1e-12 is far above the certificate radius and
+    # float noise, far below any measured real turn (min 2.7e-3 on the
+    # 322 census; ~8e-5 for retry-unfrozen tiny folds).
+    cert['neoconvex'] = (tr['min_nonflat'] is not None and tr['min_nonflat'] > 1e-12)
+    if cert.get('ok') and not cert['neoconvex']:
+        cert['ok'] = False
+        cert['why'] = 'certified root not neoconvex (vertex turn <= 0)'
     netio.write_bends(stem + ".bends", clers or "?", eab, flats, fold_out or bends_s, cert, tr)
     if faces:
         coords, worst, sign = netio.develop_best(faces, eab, bends_exact)

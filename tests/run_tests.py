@@ -26,6 +26,7 @@ with tempfile.TemporaryDirectory() as td:
     check("fold: kantorovich margin", cert.get("h", 1) < 1e-20)
     check("fold: neoconvex turning", cert["turning"]["min_nonflat"] > 0,
           f"min {cert['turning']['min_nonflat']}")
+    check("fold: neoconvex gated", cert.get("neoconvex") is True)
     check("fold: develop closes", cert.get("develop_spread", 1) < 1e-12,
           f"spread {cert.get('develop_spread'):.2e}")
     stem = [os.path.join(td, f[:-6]) for f in os.listdir(td) if f.endswith(".bends")
