@@ -36,8 +36,9 @@ they are included in the outputs.
 
 ## Requirements
 
-python3, gmpy2 (`pip install gmpy2`), and the `clers` binary
-(CLERS name → face list) on PATH or named by `CLERS_BIN`.
+python3, gmpy2 >= 2.3 (`pip install "gmpy2>=2.3"` — 2.1.x retains
+every mpfr temporary, ~1.5 GB leaked per net in batch runs), and the
+`clers` binary (CLERS name → face list) on PATH or named by `CLERS_BIN`.
 
 ## Usage
 
