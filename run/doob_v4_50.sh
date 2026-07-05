@@ -11,7 +11,7 @@ PIPE=$HOME/neo/data/pipeline_v4_50_20260514T103000Z
 CLERS_BIN=$HOME/neo/clers/bin/clers
 RUN=$HOME/bendprover_run_v4_50
 REPO=$HOME/bendprover
-WORKERS=90
+WORKERS=96
 
 stage() {
   # identity source: solvermanifest/all.tsv = index, status, netcode, objpath
