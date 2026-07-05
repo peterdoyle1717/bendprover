@@ -73,9 +73,10 @@ def process(clers, seedpath, outdir, clers_bin="clers"):
     if seedpath.endswith(".dump"):
         dclers, eab, bends_s, stars = netio.read_dump(seedpath)
         clers = clers or dclers
+        faces = get_faces(clers, eab, clers_bin)
     else:
-        eab, bends_s, stars = netio.bends_from_obj(seedpath)
-    faces = get_faces(clers, eab, clers_bin)
+        # obj seeds carry their own faces: no decode in the batch hot loop
+        eab, bends_s, stars, faces = netio.bends_from_obj(seedpath)
     bends_f = {e: float(b) for e, b in bends_s.items()}
     flats, pis, folds = classify(bends_s)
     # global mirror fix for obj seeds

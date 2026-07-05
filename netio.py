@@ -81,7 +81,9 @@ def dot(u, v): return u[0]*v[0]+u[1]*v[1]+u[2]*v[2]
 def norm(u): return math.sqrt(dot(u, u))
 
 def bends_from_obj(path):
-    """signed bends from coordinates; sign fixed globally by closure test upstream."""
+    """signed bends from coordinates; sign fixed globally by closure test
+    upstream. Also returns the obj's own (1-based) faces, so development
+    needs no external decode."""
     V, F = read_obj(path)
     faces = [tuple(f) for f in F]
     eab, stars = stars_from_faces([(a+1, b+1, c+1) for a, b, c in faces])  # 1-based vertices
@@ -106,7 +108,7 @@ def bends_from_obj(path):
         s = dot(cross(n1, n2), edge)
         b = math.atan2(math.copysign(norm(cross(n1, n2)), s), cosd)
         bends[e] = repr(b)
-    return eab, bends, stars
+    return eab, bends, stars, [(a + 1, b + 1, c + 1) for a, b, c in faces]
 
 # ---------- development (bends -> coords) ----------
 S3 = math.sqrt(3.0)/2
