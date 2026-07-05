@@ -22,15 +22,18 @@ usage:
 import sys, os, math, json
 import netio, mpkernel
 
-FLAT_TOL = 1e-4
+FLAT_TOL = 1e-4      # census flat gap 3.7e-4 for the 322 floppers, but the
+RETRY_TOL = 1e-7     # full v<=50 population has genuine folds below 1e-4:
+                     # on certificate failure, retry with the tighter tol
+                     # (still far above DP-seed noise on true flats)
 PI = math.pi
 
-def classify(bends):
+def classify(bends, flat_tol=FLAT_TOL):
     flats = set(); pis = set(); folds = []
     for e, b in bends.items():
         fb = float(b)
-        if abs(fb) < FLAT_TOL: flats.add(e)
-        elif abs(abs(fb) - PI) < FLAT_TOL: pis.add(e)
+        if abs(fb) < flat_tol: flats.add(e)
+        elif abs(abs(fb) - PI) < flat_tol: pis.add(e)
         else: folds.append(e)
     return flats, pis, sorted(folds)
 
@@ -107,6 +110,19 @@ def process(clers, seedpath, outdir, clers_bin="clers"):
         with open(stem + ".cert", "w") as f: json.dump(cert, f, indent=1)
         return cert
     cs, cert = mpkernel.solve_and_certify(stars, flats, folds, bends_s)
+    cert['flat_tol'] = FLAT_TOL
+    if not cert.get('ok') and flats:
+        # a sub-threshold genuine fold frozen flat leaves the system
+        # inconsistent (Newton stalls at eta ~ the frozen bend); unfreeze
+        # near-threshold edges and re-certify
+        flats2, pis2, folds2 = classify(bends_s, RETRY_TOL)
+        if folds2 != folds and not pis2:
+            cs2, cert2 = mpkernel.solve_and_certify(stars, flats2, folds2, bends_s)
+            cert2['flat_tol'] = RETRY_TOL
+            cert2['first_try'] = dict(flat_tol=FLAT_TOL, h=cert.get('h'),
+                                      eta=cert.get('eta'), why=cert.get('why'))
+            if cert2.get('ok'):
+                cs, cert, flats, folds = cs2, cert2, flats2, folds2
     fold_out = {}
     if cs is not None:
         digs = mpkernel.bend_strings(cs, folds)
