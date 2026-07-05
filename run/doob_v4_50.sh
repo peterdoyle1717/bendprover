@@ -54,11 +54,13 @@ launch() {
 }
 
 status() {
+  # durable metrics only: chunk logs are truncated when a chunk restarts,
+  # so PASS/FAIL greps over live logs mislead after a relaunch
   total=$(ls $RUN/chunks | wc -l)
   done_=$(ls $RUN/out/*.done 2>/dev/null | wc -l)
-  pass=$(cat $RUN/log/*.log 2>/dev/null | grep -c '^PASS' || true)
-  fail=$(cat $RUN/log/*.log 2>/dev/null | grep -c '^FAIL' || true)
-  echo "chunks $done_/$total   nets: $pass pass, $fail fail"
+  certs=$(find $RUN/out -name '*.cert' | wc -l)
+  fails=$(grep -rL '"ok": true' --include='*.cert' $RUN/out 2>/dev/null | wc -l)
+  echo "chunks $done_/$total   certs $certs (fail $fails)"
 }
 
 "$@"
