@@ -11,3 +11,7 @@ census:
 	CLERS_BIN=$(CLERS_BIN) python3 bendprover.py --batch /tmp/bendprover_census_list.txt census322
 
 .PHONY: test census
+
+# MPFR LM solver (arm64 homebrew paths; adjust -I/-L for other hosts)
+csrc/euclid_lm_mp: csrc/euclid_lm_mp.c
+	cc -O2 -Wall -I/opt/homebrew/include -L/opt/homebrew/lib -o $@ $< -lmpfr -lgmp
