@@ -53,6 +53,7 @@ static int NFREE;
 static mpfr_prec_t PREC = 128;
 static const char *FLATS_STR = NULL;   /* "a,b;c,d;..." vertex pairs */
 static const char *SEED_PATH = NULL;   /* lines: a b bend-decimal */
+static int BENDS_ONLY = 0;             /* omit v/f lines from output */
 
 /* ---------------- topology: identical to euclid_clean.c ---------------- */
 
@@ -556,6 +557,7 @@ static int write_obj(FILE *fp)
         else
             mpfr_fprintf(fp, "# bend %d %d %d %.40Re\n", e, EDGE_A[e], EDGE_B[e], BEND[e]);
     }
+    if (BENDS_ONLY) return ferror(fp) ? -1 : 0;
     for (int v = 1; v <= NV; v++)
         mpfr_fprintf(fp, "v %.40Rf %.40Rf %.40Rf\n",
                      VXYZ[v][0], VXYZ[v][1], VXYZ[v][2]);
@@ -649,8 +651,11 @@ int main(int argc, char **argv)
             FLATS_STR = argv[argi + 1]; argi += 2;
         } else if (strcmp(argv[argi], "--seed") == 0) {
             SEED_PATH = argv[argi + 1]; argi += 2;
+        } else if (strcmp(argv[argi], "--bends-only") == 0) {
+            BENDS_ONLY = 1; argi += 1;
         } else break;
     }
+    if (argi < argc && strcmp(argv[argi], "--bends-only") == 0) { BENDS_ONLY = 1; argi++; }
     mp_init_all();
 
     if (argi < argc && strcmp(argv[argi], "--batch") != 0) {
@@ -667,7 +672,7 @@ int main(int argc, char **argv)
             (void)len; chomp(line);
             if (!line[0]) continue;
             char errmsg[512];
-            printf("=== %ld begin\n", idx);
+            printf("=== %ld %s\n", idx, line);
             int rc = solve_one_netcode(line, stdout, errmsg, sizeof(errmsg));
             printf("=== %ld %s %s\n", idx, rc == 0 ? "ok" : "fail", rc == 0 ? "" : errmsg);
             fails += (rc != 0);
