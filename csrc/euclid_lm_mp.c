@@ -44,7 +44,15 @@ static int VERT_DEG[MAXV + 1];
 static int FLOWER_LEN[MAXV + 1];
 static int FLOWER_E[MAXV + 1][MAXDEG];
 
+/* specified flatfaces: frozen edges have bend identically 0 and are not
+   LM variables. FREE_E lists the variable edges. */
+static int IS_FLAT[MAXE];
+static int FREE_E[MAXE];
+static int NFREE;
+
 static mpfr_prec_t PREC = 128;
+static const char *FLATS_STR = NULL;   /* "a,b;c,d;..." vertex pairs */
+static const char *SEED_PATH = NULL;   /* lines: a b bend-decimal */
 
 /* ---------------- topology: identical to euclid_clean.c ---------------- */
 
@@ -293,9 +301,10 @@ static void jacobian_cols(mpfr_t *bend)
         for (int t = k - 1; t >= 0; t--) q_mul(QS[t], SSUF[t + 1], SSUF[t]);
 
         for (int t = 0; t < k; t++) {
+            int e = FLOWER_E[v][t];
+            if (IS_FLAT[e]) continue;          /* frozen: not a variable */
             q_mul(PPRE[t], DQS[t], QTMP2);
             q_mul(QTMP2, SSUF[t + 1], QTMP2);
-            int e = FLOWER_E[v][t];
             int side = (EDGE_A[e] == v) ? 0 : 3;
             for (int c = 0; c < 3; c++)
                 mpfr_add(JCOL[e][side + c], JCOL[e][side + c], QTMP2[c + 1], MPFR_RNDN);
@@ -307,12 +316,13 @@ static void jacobian_cols(mpfr_t *bend)
    rows of shared endpoint vertices. */
 static void normal_matrix(void)
 {
-    for (int p = 0; p < NE; p++)
-        for (int q = p; q < NE; q++) mpfr_set_ui(A_BUF[p][q], 0, MPFR_RNDN);
+    for (int pf = 0; pf < NFREE; pf++)
+        for (int qf = pf; qf < NFREE; qf++) mpfr_set_ui(A_BUF[pf][qf], 0, MPFR_RNDN);
 
-    for (int p = 0; p < NE; p++) {
-        for (int q = p; q < NE; q++) {
-            int touched = 0;
+    for (int pf = 0; pf < NFREE; pf++) {
+        int p = FREE_E[pf];
+        for (int qf = pf; qf < NFREE; qf++) {
+            int q = FREE_E[qf];
             for (int sp = 0; sp < 2; sp++) {
                 int vp = sp ? EDGE_B[p] : EDGE_A[p];
                 for (int sq = 0; sq < 2; sq++) {
@@ -320,27 +330,26 @@ static void normal_matrix(void)
                     if (vp != vq) continue;
                     for (int c = 0; c < 3; c++) {
                         mpfr_mul(T1, JCOL[p][3 * sp + c], JCOL[q][3 * sq + c], MPFR_RNDN);
-                        mpfr_add(A_BUF[p][q], A_BUF[p][q], T1, MPFR_RNDN);
+                        mpfr_add(A_BUF[pf][qf], A_BUF[pf][qf], T1, MPFR_RNDN);
                     }
-                    touched = 1;
                 }
             }
-            (void)touched;
         }
     }
-    for (int p = 0; p < NE; p++)
-        for (int q = 0; q < p; q++) mpfr_set(A_BUF[p][q], A_BUF[q][p], MPFR_RNDN);
+    for (int pf = 0; pf < NFREE; pf++)
+        for (int qf = 0; qf < pf; qf++) mpfr_set(A_BUF[pf][qf], A_BUF[qf][pf], MPFR_RNDN);
 }
 
 static void grad_vec(mpfr_t *r)
 {
-    for (int p = 0; p < NE; p++) {
-        mpfr_set_ui(G_BUF[p], 0, MPFR_RNDN);
+    for (int pf = 0; pf < NFREE; pf++) {
+        int p = FREE_E[pf];
+        mpfr_set_ui(G_BUF[pf], 0, MPFR_RNDN);
         for (int sp = 0; sp < 2; sp++) {
             int vp = sp ? EDGE_B[p] : EDGE_A[p];
             for (int c = 0; c < 3; c++) {
                 mpfr_mul(T1, JCOL[p][3 * sp + c], r[3 * (vp - 1) + c], MPFR_RNDN);
-                mpfr_add(G_BUF[p], G_BUF[p], T1, MPFR_RNDN);
+                mpfr_add(G_BUF[pf], G_BUF[pf], T1, MPFR_RNDN);
             }
         }
     }
@@ -350,7 +359,7 @@ static void grad_vec(mpfr_t *r)
    pivot is nonpositive (raise lambda, like dgesv info != 0). */
 static int chol_solve_neg(void)
 {
-    int n = NE;
+    int n = NFREE;
     for (int i = 0; i < n; i++) {
         for (int j = i; j < n; j++) mpfr_set(M_BUF[j][i], A_BUF[j][i], MPFR_RNDN);
         mpfr_mul(T1, LAMBDA, D_BUF[i], MPFR_RNDN);
@@ -417,7 +426,7 @@ static int lm_solve(int maxiter)
         jacobian_cols(BEND);
         normal_matrix();
         grad_vec(R_BUF);
-        for (int p = 0; p < NE; p++) mpfr_set(D_BUF[p], A_BUF[p][p], MPFR_RNDN);
+        for (int pf = 0; pf < NFREE; pf++) mpfr_set(D_BUF[pf], A_BUF[pf][pf], MPFR_RNDN);
 
         int accepted = 0;
         for (int retry = 0; retry < 20; retry++) {
@@ -426,8 +435,9 @@ static int lm_solve(int maxiter)
                 if (mpfr_cmp_d(LAMBDA, 1e12) > 0) return -1;
                 continue;
             }
-            for (int e = 0; e < NE; e++)
-                mpfr_add(BEND_T[e], BEND[e], DELTA[e], MPFR_RNDN);
+            for (int e = 0; e < NE; e++) mpfr_set(BEND_T[e], BEND[e], MPFR_RNDN);
+            for (int pf = 0; pf < NFREE; pf++)
+                mpfr_add(BEND_T[FREE_E[pf]], BEND[FREE_E[pf]], DELTA[pf], MPFR_RNDN);
             int dent_v = has_dent(BEND_T);
             residual(BEND_T, RT_BUF);
             vec_norm2(NTRIAL, RT_BUF, rows);
@@ -538,10 +548,14 @@ static int realize(void)
 
 static int write_obj(FILE *fp)
 {
-    mpfr_fprintf(fp, "# euclid_lm_mp prec=%ld resid=%.3Re iters=%d\n",
-                 (long)PREC, NORM, LM_ITERS);
-    for (int e = 0; e < NE; e++)
-        mpfr_fprintf(fp, "# bend %d %d %d %.40Re\n", e, EDGE_A[e], EDGE_B[e], BEND[e]);
+    mpfr_fprintf(fp, "# euclid_lm_mp prec=%ld resid=%.3Re iters=%d nflat=%d\n",
+                 (long)PREC, NORM, LM_ITERS, NE - NFREE);
+    for (int e = 0; e < NE; e++) {
+        if (IS_FLAT[e])
+            fprintf(fp, "# bend %d %d %d 0 flat\n", e, EDGE_A[e], EDGE_B[e]);
+        else
+            mpfr_fprintf(fp, "# bend %d %d %d %.40Re\n", e, EDGE_A[e], EDGE_B[e], BEND[e]);
+    }
     for (int v = 1; v <= NV; v++)
         mpfr_fprintf(fp, "v %.40Rf %.40Rf %.40Rf\n",
                      VXYZ[v][0], VXYZ[v][1], VXYZ[v][2]);
@@ -552,6 +566,46 @@ static int write_obj(FILE *fp)
 
 /* ---------------- drivers ---------------- */
 
+/* parse "a,b;c,d;..." into IS_FLAT; returns -1 on unknown pair */
+static int parse_flats(const char *s)
+{
+    for (int e = 0; e < NE; e++) IS_FLAT[e] = 0;
+    if (s) {
+        const char *p = s;
+        while (*p) {
+            int a, b;
+            if (sscanf(p, "%d,%d", &a, &b) != 2) return -1;
+            int lo = a < b ? a : b, hi = a < b ? b : a;
+            if (lo < 1 || hi > NV || EDGE_IDX[lo][hi] < 0) return -1;
+            IS_FLAT[EDGE_IDX[lo][hi]] = 1;
+            while (*p && *p != ';') p++;
+            if (*p == ';') p++;
+        }
+    }
+    NFREE = 0;
+    for (int e = 0; e < NE; e++)
+        if (!IS_FLAT[e]) FREE_E[NFREE++] = e;
+    return 0;
+}
+
+/* seed file: lines "a b bend-decimal"; applies to free edges only */
+static int load_seed(const char *path)
+{
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    char buf[4096];
+    while (fgets(buf, sizeof buf, fp)) {
+        int a, b, off = 0;
+        if (sscanf(buf, "%d %d %n", &a, &b, &off) < 2) continue;
+        int lo = a < b ? a : b, hi = a < b ? b : a;
+        if (lo < 1 || hi > NV || EDGE_IDX[lo][hi] < 0) { fclose(fp); return -1; }
+        int e = EDGE_IDX[lo][hi];
+        if (!IS_FLAT[e]) mpfr_set_str(BEND[e], buf + off, 10, MPFR_RNDN);
+    }
+    fclose(fp);
+    return 0;
+}
+
 static int solve_one_netcode(const char *netcode, FILE *objout,
                              char *errmsg, size_t errmsgsize)
 {
@@ -559,8 +613,13 @@ static int solve_one_netcode(const char *netcode, FILE *objout,
     if (errmsgsize > 0) errmsg[0] = '\0';
     if (parse_netcode(netcode) <= 0) { snprintf(errmsg, errmsgsize, "parse failed"); return 1; }
     if (build_topology() < 0) { snprintf(errmsg, errmsgsize, "build_topology failed"); return 1; }
+    if (parse_flats(FLATS_STR) < 0) { snprintf(errmsg, errmsgsize, "bad --flats"); return 1; }
     if (wish_init_double(wish) < 0) { snprintf(errmsg, errmsgsize, "wish_init failed"); return 1; }
-    for (int e = 0; e < NE; e++) mpfr_set_d(BEND[e], wish[e], MPFR_RNDN);
+    for (int e = 0; e < NE; e++)
+        mpfr_set_d(BEND[e], IS_FLAT[e] ? 0.0 : wish[e], MPFR_RNDN);
+    if (SEED_PATH && load_seed(SEED_PATH) < 0) {
+        snprintf(errmsg, errmsgsize, "bad --seed"); return 1;
+    }
     mpfr_const_pi(ALPHA, MPFR_RNDN);
     mpfr_div_ui(ALPHA, ALPHA, 3, MPFR_RNDN);
     /* tol = 2^(-3*prec/4): ~1e-29 at 128 bits */
@@ -581,10 +640,16 @@ static void chomp(char *s)
 int main(int argc, char **argv)
 {
     int argi = 1;
-    if (argi + 1 < argc + 1 && argi < argc && strcmp(argv[argi], "--prec") == 0) {
-        PREC = (mpfr_prec_t)atol(argv[argi + 1]);
-        if (PREC < 24 || PREC > 8192) { fprintf(stderr, "bad prec\n"); return 2; }
-        argi += 2;
+    while (argi + 1 < argc) {
+        if (strcmp(argv[argi], "--prec") == 0) {
+            PREC = (mpfr_prec_t)atol(argv[argi + 1]);
+            if (PREC < 24 || PREC > 8192) { fprintf(stderr, "bad prec\n"); return 2; }
+            argi += 2;
+        } else if (strcmp(argv[argi], "--flats") == 0) {
+            FLATS_STR = argv[argi + 1]; argi += 2;
+        } else if (strcmp(argv[argi], "--seed") == 0) {
+            SEED_PATH = argv[argi + 1]; argi += 2;
+        } else break;
     }
     mp_init_all();
 
@@ -611,6 +676,6 @@ int main(int argc, char **argv)
         free(line);
         return fails ? 1 : 0;
     }
-    fprintf(stderr, "usage: %s [--prec BITS] NETCODE | --batch < netcodes\n", argv[0]);
+    fprintf(stderr, "usage: %s [--prec BITS] [--flats \"a,b;c,d\"] [--seed FILE] NETCODE | --batch < netcodes\n", argv[0]);
     return 2;
 }
