@@ -72,9 +72,9 @@ def certify_one(nc, bendmap):
         tmin = lo if tmin is None else min(tmin, lo)
         tmax = hi if tmax is None else max(tmax, hi)
     cert["tmin"] = tmin; cert["tmax"] = tmax
-    if tmin is not None and (tmin <= 0 or tmax >= GEM):
-        cert["ok"] = False
-        cert["why"] = "turning window violated"
+    # modular verdicts: ok = existence certificate; neoconvex = the
+    # independent window check on the certified bends + radius
+    cert["neoconvex"] = bool(tmin is not None and tmin > 0 and tmax < GEM)
     return cert, fout, (eab, flats)
 
 def main():
@@ -86,7 +86,7 @@ def main():
     out_cb = open(args[2], "a") if len(args) > 2 else None
     npass = nfail = nskip = 0
     with open(out_tsv, "w") as out:
-        out.write("idx\tV\tok\tnflat\tsig_low\th\tradius\tdrop_bound\ttmin\ttmax\twhy\n")
+        out.write("idx\tV\tok\tneoconvex\tnflat\tsig_low\th\tradius\tdrop_bound\ttmin\ttmax\twhy\n")
         for idx, nc, bendmap in parse_records(chunk):
             try:
                 V = max(x for f in nc.split(";") for x in
@@ -100,13 +100,15 @@ def main():
             ok = bool(cert.get("ok"))
             npass += ok; nfail += (not ok)
             out.write(f"{idx}\t{cert.get('V')}\t{'PASS' if ok else 'FAIL'}\t"
+                      f"{'Y' if cert.get('neoconvex') else 'N'}\t"
                       f"{cert.get('nflat')}\t{cert.get('sig_low','')}\t"
                       f"{cert.get('h','')}\t{cert.get('radius','')}\t"
                       f"{cert.get('drop_bound','')}\t{cert.get('tmin','')}\t"
                       f"{cert.get('tmax','')}\t{cert.get('why','')}\n")
-            if ok and fout is not None and cert.get("nflat", 0) > 0 and out_cb:
+            if ok and fout is not None and out_cb:
+                # THE deliverable: bends (flats identically 0) + error bound
                 eab, flats = extra
-                out_cb.write(f"=== {idx} {nc}\n")
+                out_cb.write(f"=== {idx} {nc} radius {cert.get('radius')}\n")
                 for e in sorted(eab):
                     a, b = eab[e]
                     out_cb.write(f"{a} {b} {'0' if e in flats else fout[e]}\n")
