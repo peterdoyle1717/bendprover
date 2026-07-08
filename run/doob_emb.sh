@@ -3,9 +3,9 @@
 # solver chunk NNN.bends, write emb/NNN.tsv of per-net verdicts
 # (PASS / PANCAKE / FAIL). Resumable; safe to run while the solver
 # fleet is still going (only touches chunks with .done markers).
+# No set -e: idle iterations (nothing to do yet) are normal.
 #
 #   run/doob_emb.sh launch | status
-set -e
 RUN=$HOME/prove_final_v4_50
 REPO=$HOME/bendprover
 WORKERS=8
@@ -15,10 +15,13 @@ loop() {
   while :; do
     todo=$(cd $RUN/out && ls *.done 2>/dev/null | sed 's/.done//' \
            | while read id; do [ -f $RUN/emb/$id.tsv ] || echo $id; done)
-    [ -n "$todo" ] && echo "$todo" | xargs -P $WORKERS -I{} sh -c \
-      "nice -19 $REPO/csrc/embcheck_mp $RUN/out/{}.bends > $RUN/emb/{}.tsv.part 2>/dev/null \
-       && mv $RUN/emb/{}.tsv.part $RUN/emb/{}.tsv"
+    if [ -n "$todo" ]; then
+      echo "$todo" | xargs -P $WORKERS -I{} sh -c \
+        "nice -19 $REPO/csrc/embcheck_mp $RUN/out/{}.bends > $RUN/emb/{}.tsv.part 2>/dev/null \
+         && mv $RUN/emb/{}.tsv.part $RUN/emb/{}.tsv" || true
+    fi
     n=$(ls $RUN/emb/*.tsv 2>/dev/null | wc -l)
+    echo "$(date +%H:%M) emb chunks $n/960"
     [ "$n" -ge 960 ] && break
     sleep 60
   done
