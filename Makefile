@@ -6,7 +6,7 @@ csrc/euclid_lm_mp: csrc/euclid_lm_mp.c
 	cc -O2 -Wall $(MPFRFLAGS) -o $@ $< -lmpfr -lgmp
 
 csrc/embcheck_mp: csrc/embcheck_mp.c
-	cc -O2 -Wall $(MPFRFLAGS) -o $@ $< -lmpfr -lgmp
+	cc -O2 -Wall $(MPFRFLAGS) -o $@ $< -lmpfr -lgmp -lm
 
 test: csrc/euclid_lm_mp
 	python3 tests/selftest_format.py
