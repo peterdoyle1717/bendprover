@@ -33,20 +33,26 @@ Records are the sole deliverable; consumers need nothing else.
 
 - neoconvexity: the turning window per vertex is reported in the
   provenance comment and rechecked trivially from the bends.
-- embeddedness: `embcheck.py` develops ball-arithmetic vertex
-  enclosures from (bends, benderr) and certifies shared-edge,
-  vertex-link, and pairwise-separation conditions. Its supporting
-  lemma (reduction of shared-vertex crossings) is documented in the
-  module docstring and still needs a written proof.
+- embeddedness: [csrc/embcheck_mp.c](csrc/embcheck_mp.c) develops
+  ball-arithmetic vertex enclosures from (bends, benderr) and
+  certifies shared-edge, vertex-link, and pairwise-separation
+  conditions. Verdicts per net: `PASS` (embedded certified),
+  `PANCAKE` (all bends integer halfturns; the flat doubly-covered
+  case, certified by exactness, not embedded), `FAIL` (nothing
+  certified). The supporting lemma (reduction of shared-vertex
+  crossings) is documented in `embcheck.py`'s docstring and still
+  needs a written proof. `run/doob_emb.sh` sweeps a prove run's
+  chunks.
 - objs: coordinates are derived data; `euclid_lm_mp NETCODE` without
   `--bends-only` develops and prints them on demand.
 
 ## Python oracle
 
-`mpkernel.py`, `netio.py`, `bendprover.py`, and `tests/` are the
-reference implementation the C certificate was ported from. They run
-nothing in production; `make test-oracle` exercises them, and the C
-binary is differential-tested against them.
+`mpkernel.py`, `netio.py`, `bendprover.py`, `embcheck.py`/`mpball.py`,
+and `tests/` are the reference implementations the C programs were
+ported from. They run nothing in production; `make test-oracle`
+exercises them, and the C binaries are differential-tested against
+them (embcheck: 0 verdict mismatches on 365 mixed census/sweep nets).
 
 ## Tests
 

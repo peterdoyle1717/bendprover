@@ -139,10 +139,13 @@ def check_net(nc, rad, bends):
     """rad and bend values in halfturns (FORMAT.md)."""
     faces = [tuple(int(x) for x in f.split(",")) for f in nc.split(";")]
     verts = sorted(set(v for f in faces for v in f))
+    # exactly-flat records are pancakes: certified by exactness, not here
+    if all(s in ("0", "1", "-1") for s in bends.values()):
+        return "PANCAKE", "all bends integer halfturns (flat pancake, not embedded)"
     # EDGE test: shared-edge faces cross iff |bend| = 1 halfturn
     for (a, b), s in bends.items():
         if s in ("1", "-1") or abs(float(s)) + rad >= 1.0 - 1e-14:
-            return "FAIL", f"edge ({a},{b}) bend at gem/2 (pancake-type)"
+            return "FAIL", f"edge ({a},{b}) bend at gem/2"
     pos = develop_balls(faces, bends, rad)
     # stars in cyclic order
     apex = {}
@@ -237,9 +240,9 @@ def main():
                 verdict, why = "FAIL", repr(ex)[:70]
             V = max(x for f in nc.split(";") for x in
                     (int(y) for y in f.split(",")))
-            np_ += (verdict == "PASS"); nf_ += (verdict != "PASS")
+            np_ += (verdict != "FAIL"); nf_ += (verdict == "FAIL")
             out.write(f"{idx}\t{V}\t{verdict}\t{why}\n")
-    print(f"done: {np_} embedded-certified, {nf_} not")
+    print(f"done: {np_} embedded-or-pancake, {nf_} FAIL")
 
 if __name__ == "__main__":
     main()

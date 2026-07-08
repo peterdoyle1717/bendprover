@@ -3,3 +3,4 @@ __pycache__/
 .DS_Store
 notes/
 csrc/euclid_lm_mp
+csrc/embcheck_mp
