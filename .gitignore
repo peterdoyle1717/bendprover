@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 .DS_Store
 notes/
+csrc/euclid_lm_mp

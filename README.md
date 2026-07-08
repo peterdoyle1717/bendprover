@@ -1,79 +1,54 @@
 # bendprover
 
-Solver + certificate for the bends of unit-equilateral triangulated
-spheres ("nets"), at uniform 128-bit precision.
+Solver and existence prover for the bends of unit-equilateral
+triangulated spheres ("nets"), at uniform multiprecision.
 
-Given a net and a numerical seed, it classifies edges as flat or
-folded, solves the vertex-closure system for the fold bends, and
-certifies existence and local uniqueness of a nearby exact root.
-Flat edges are reported as exactly 0.
+The pipeline is one C program, [csrc/euclid_lm_mp.c](csrc/euclid_lm_mp.c):
+Levenberg–Marquardt with a dent gate on the quaternion holonomy system,
+from a closed-form wish start, at `--prec` bits (default 128). In
+`--prove` mode each net gets the full treatment in one invocation:
 
-## Formulation
+    solve from scratch -> classify flat edges (1e-8) -> re-solve with
+    flats frozen to exactly 0 -> take-1 existence certificate
+    (Newton polish on quaternion pairs, numerically selected square
+    subsystem, Cholesky factor witness, Kantorovich) -> emit record
 
-Fold edge `e` carries a quaternion pair `(c,s) ~ (cos b/2, sin b/2)`
-with unit row `c² + s² = 1`. Vertex closure is the quaternion word
+Records follow [FORMAT.md](FORMAT.md): bends in halfturns, integer
+values exact (0 = flat, 1 = folded shut; degenerate pancakes are
+all-integer with `benderr 0`), decimals certified within the record's
+`benderr`, proof internals in a `#` provenance comment.
 
-    ∏ over the star of  T₆₀ · (c,s,0,0)  =  ±1,
+## Build and run
 
-with `T₆₀ = (√3/2, 0, 0, 1/2)` the 60° face turn and flat edges
-structurally absent (faces merged into flat plates). The residuals are
-polynomial — multilinear in the pairs — so the prover needs no
-transcendental functions. Newton runs at 128 bits (gmpy2/MPFR).
+    make euclid_lm_mp          # needs mpfr + gmp
+    echo 'CCAE 1,2,3;1,3,4;1,4,2;2,4,3' | csrc/euclid_lm_mp --prove --batch
 
-The certificate takes a numerically selected square row subsystem,
-lower-bounds its smallest singular value by a Cholesky factor witness
-(`δ = ‖I−BC‖`, `σ ≥ (1−δ)/‖B‖`, margin `σ_C² − ‖A−CCᵀ‖`), and applies
-Kantorovich with the explicit multilinear Hessian bound `L = 4·arity²`.
-Rounding is charged to the standard 128-bit model with a ×64 slop
-factor. What is certified: an exact root of the selected subsystem
-within the reported radius; the dropped closure rows are evaluated and
-bounded (`drop_bound`), and their exact discharge is the lune lemma
-plus the monodromy identity at one excised plate.
+Batch lines are `NAME NETCODE` (name optional). `run/doob_prove.sh`
+is the production driver: chunked netcode lists, one solver process
+per chunk, nice 19.
 
-Pancakes — nets whose solution is a doubly covered flat region, every
-edge 0 or τ/2 — are recognized and passed through without solving;
-they are included in the outputs.
+## Downstream checks
 
-## Requirements
+Records are the sole deliverable; consumers need nothing else.
 
-python3, gmpy2 >= 2.3 (`pip install "gmpy2>=2.3"` — 2.1.x retains
-every mpfr temporary, ~1.5 GB leaked per net in batch runs), and the
-`clers` binary (CLERS name → face list) on PATH or named by `CLERS_BIN`.
+- neoconvexity: the turning window per vertex is reported in the
+  provenance comment and rechecked trivially from the bends.
+- embeddedness: `embcheck.py` develops ball-arithmetic vertex
+  enclosures from (bends, benderr) and certifies shared-edge,
+  vertex-link, and pairwise-separation conditions. Its supporting
+  lemma (reduction of shared-vertex crossings) is documented in the
+  module docstring and still needs a written proof.
+- objs: coordinates are derived data; `euclid_lm_mp NETCODE` without
+  `--bends-only` develops and prints them on demand.
 
-## Usage
+## Python oracle
 
-    # single net from a bend_sweep dump (CLERS read from its CASE line)
-    python3 bendprover.py --dump net.dump OUT/
-
-    # single net seeded from coordinates
-    python3 bendprover.py --clers CCC...E --obj net.obj OUT/
-
-    # batch: one seed path per line (or "CLERS<TAB>path")
-    python3 bendprover.py --batch list.txt OUT/
-
-Per net `OUT/` gets `v<NV><CLERS>.bends` (flats exact 0, folds to
-40 digits, certificate and turning summary in the header),
-`.cert` (full certificate record, JSON), and `.obj` (coordinates
-developed from the bends, for the embeddedness step; per-vertex
-placement spread is reported as `develop_spread`).
-
-The `TURNING` line reports the minimum total turning over non-flat
-vertices; positive means the object is neoconvex with exact flats.
-
-Obj seeds must use the same vertex numbering as the `clers` decode of
-the named net (the pipeline checks and refuses otherwise); dumps carry
-their own numbering and always work.
+`mpkernel.py`, `netio.py`, `bendprover.py`, and `tests/` are the
+reference implementation the C certificate was ported from. They run
+nothing in production; `make test-oracle` exercises them, and the C
+binary is differential-tested against them.
 
 ## Tests
 
-    make test
-
-runs an end-to-end fold net (certify, bends match a 200-digit
-reference dump, obj round-trip re-certifies the same root, turning
-positive) and the pancake path.
-
-## Reference run
-
-`census322/` holds the output of a full run over the 322-net flopper
-census (276 certified fold nets + 46 pancakes), produced by
-`make census` with the dump directory named in the Makefile.
+    make test          # format self-tests: closed-form bend checks
+    make test-oracle   # the Python reference pipeline

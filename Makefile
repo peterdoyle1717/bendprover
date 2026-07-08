@@ -1,17 +1,14 @@
-# override on the command line as needed, e.g.
-#   make test CLERS_BIN=~/Dropbox/neo/clers/bin/clers
+# mpfr/gmp paths: /opt/homebrew for arm64 macs; plain -lmpfr -lgmp on linux
+MPFRFLAGS ?= $(shell [ -d /opt/homebrew/include ] && echo "-I/opt/homebrew/include -L/opt/homebrew/lib")
 CLERS_BIN ?= clers
-DUMPS ?= /Users/doyle/Dropbox/neo/_parking/bendq_sandbox/dumps
 
-test:
+csrc/euclid_lm_mp: csrc/euclid_lm_mp.c
+	cc -O2 -Wall $(MPFRFLAGS) -o $@ $< -lmpfr -lgmp
+
+test: csrc/euclid_lm_mp
+	python3 tests/selftest_format.py
+
+test-oracle:
 	CLERS_BIN=$(CLERS_BIN) python3 tests/run_tests.py
 
-census:
-	ls $(DUMPS)/*.dump > /tmp/bendprover_census_list.txt
-	CLERS_BIN=$(CLERS_BIN) python3 bendprover.py --batch /tmp/bendprover_census_list.txt census322
-
-.PHONY: test census
-
-# MPFR LM solver (arm64 homebrew paths; adjust -I/-L for other hosts)
-csrc/euclid_lm_mp: csrc/euclid_lm_mp.c
-	cc -O2 -Wall -I/opt/homebrew/include -L/opt/homebrew/lib -o $@ $< -lmpfr -lgmp
+.PHONY: test test-oracle

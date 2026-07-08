@@ -33,20 +33,34 @@ PI = math.pi
 COS_ARC = 0.5          # link arcs have length exactly pi/3
 
 def parse_records(path):
-    idx = nc = None; rad = 0.0; bends = {}
+    """FORMAT.md records: net/v/e/unit/benderr/faces/#/b.../end.
+    Values are in halfturns; benderr is the per-bend bound in
+    halfturns (0 = exact record)."""
+    name = nc = None; benderr = 0.0; bends = {}
     for ln in open(path):
         t = ln.split()
-        if not t: continue
-        if t[0] == "===":
-            if nc is not None:
-                yield idx, nc, rad, bends
-            idx, nc = t[1], t[2]
-            rad = float(t[4]) if len(t) >= 5 and t[3] == "radius" else 0.0
-            bends = {}
-        elif len(t) == 3 and nc is not None:
-            bends[(int(t[0]), int(t[1]))] = t[2]
-    if nc is not None:
-        yield idx, nc, rad, bends
+        if not t or t[0] == "#": continue
+        if t[0] == "net":
+            name = t[1]; nc = None; benderr = 0.0; bends = {}
+        elif t[0] == "benderr":
+            benderr = float(t[1])
+        elif t[0] == "faces":
+            nc = t[1]
+        elif t[0] == "b":
+            bends[(int(t[1]), int(t[2]))] = t[3]
+        elif t[0] == "end" and nc is not None:
+            yield name, nc, benderr, bends
+            name = nc = None; bends = {}
+
+def bend_ball(valstr, benderr):
+    """halfturn value string -> radian Ball. Integer tokens are exact;
+    decimals carry benderr (halfturns)."""
+    piB = Ball(gmpy2.const_pi(), 1e-55)
+    if valstr in ("0",):
+        return Ball(0, 0.0)
+    if valstr in ("1", "-1"):
+        return Ball(int(valstr)) * piB
+    return Ball(mpfr(valstr), benderr) * piB
 
 def develop_balls(faces, bend_of_pair, rad):
     """directed-edge BFS development in ball arithmetic; returns
@@ -78,7 +92,7 @@ def develop_balls(faces, bend_of_pair, rad):
             e = vsub(B, A)
             w = vunit(vsub(P, M))
             n = vunit(vcross(w, e))
-            th = Ball(mpfr(bend_of_pair[tuple(sorted((x, y)))]), rad)
+            th = bend_ball(bend_of_pair[tuple(sorted((x, y)))], rad)
             ct, st = th.cos(), th.sin()
             cperp = vadd(vscale(-ct, w), vscale(st, n))
             D = vadd(M, vscale(Ball(gmpy2.sqrt(mpfr(3)) / 2, 1e-56), cperp))
@@ -122,11 +136,12 @@ def merged_pair_disjoint(P, Q):
     return True
 
 def check_net(nc, rad, bends):
+    """rad and bend values in halfturns (FORMAT.md)."""
     faces = [tuple(int(x) for x in f.split(",")) for f in nc.split(";")]
     verts = sorted(set(v for f in faces for v in f))
-    # EDGE test
+    # EDGE test: shared-edge faces cross iff |bend| = 1 halfturn
     for (a, b), s in bends.items():
-        if abs(float(s)) + rad >= PI - 1e-12:
+        if s in ("1", "-1") or abs(float(s)) + rad >= 1.0 - 1e-14:
             return "FAIL", f"edge ({a},{b}) bend at gem/2 (pancake-type)"
     pos = develop_balls(faces, bends, rad)
     # stars in cyclic order
@@ -144,7 +159,7 @@ def check_net(nc, rad, bends):
         # exact flats from the record: corner at cyc[i] is flat iff the
         # edge (v, cyc[i]) has bend identically 0 -> its two faces are
         # exactly coplanar and the arcs merge structurally
-        flatc = [float(bends[tuple(sorted((v, cyc[i])))]) == 0.0 for i in range(d)]
+        flatc = [bends[tuple(sorted((v, cyc[i])))] == "0" for i in range(d)]
         if all(flatc):
             continue             # fully flat vertex: star is a flat disk
         dirs = [vunit(vsub(pos[w], pos[v])) for w in cyc]
