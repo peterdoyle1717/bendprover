@@ -63,6 +63,9 @@ static int CERT_OK;
 static double CERT_SIG, CERT_H, CERT_RADIUS, CERT_DROP, CERT_ETA,
     CERT_TMIN, CERT_TMAX;
 static const char *CERT_WHY = "";
+static double CERT_DROP_AT;
+static double PROVE_TOL_USED;
+static mpfr_t BSAVE[MAXE];
 
 /* ---------------- topology: identical to euclid_clean.c ---------------- */
 
@@ -633,6 +636,7 @@ static void cert_init_all(void)
     for (int t = 0; t < 2 * MAXDEG + 2; t++)
         for (int k = 0; k < 4; k++) { mpfr_init2(PRE[t][k], PREC); mpfr_init2(SUF[t][k], PREC); }
     mpfr_inits2(PREC, CT1, CT2, CT3, (mpfr_ptr)0);
+    for (int e = 0; e < MAXE; e++) mpfr_init2(BSAVE[e], PREC);
     mpfr_sqrt_ui(T60Q[0], 3, MPFR_RNDN); mpfr_div_ui(T60Q[0], T60Q[0], 2, MPFR_RNDN);
     mpfr_set_ui(T60Q[1], 0, MPFR_RNDN); mpfr_set_ui(T60Q[2], 0, MPFR_RNDN);
     mpfr_set_d(T60Q[3], 0.5, MPFR_RNDN);
@@ -1010,6 +1014,7 @@ static int certify(void)
         double x = fabs(mpfr_get_d(R2[i], MPFR_RNDN));
         if (x > drop_at) drop_at = x;
     }
+    CERT_DROP_AT = drop_at;
     double drop = drop_at + CSLOP * arity * U + arity * radius;
     /* neoconvex window on the emitted bends, margin deg*2*radius */
     double tmin = 1e300, tmax = -1e300; int anyt = 0;
@@ -1051,8 +1056,10 @@ static int write_prove_record(FILE *fp, const char *name, const char *netcode)
         fprintf(fp, "benderr %.1e\n", benderr);
         fprintf(fp, "faces %s\n", netcode);
         fprintf(fp, "# proof: kantorovich at %ld bits, jacobian sigma_min %.3e, "
-                    "h %.3e, turning window [%.9e, %.9e], solver euclid_lm_mp%s%s\n",
+                    "h %.3e, turning window [%.9e, %.9e], flats at %.0e, "
+                    "solver euclid_lm_mp%s%s\n",
                 (long)PREC, CERT_SIG, CERT_H, CERT_TMIN, CERT_TMAX,
+                PROVE_TOL_USED,
                 CERT_OK ? "" : ", CERTIFICATE FAILED: ",
                 CERT_OK ? "" : CERT_WHY);
     }
@@ -1155,25 +1162,44 @@ static int solve_one_netcode(const char *netcode, const char *name,
                 if (!IS_FLAT[e]) IS_PI[e] = (b > 0) ? 1 : -1;
             }
         } else {
-            /* classify flats, refreeze, re-solve, certify */
-            int newflats = 0;
-            for (int e = 0; e < NE; e++) {
-                if (!IS_FLAT[e] && fabs(mpfr_get_d(BEND[e], MPFR_RNDN)) < PROVE_FLAT_TOL) {
-                    IS_FLAT[e] = 1;
-                    mpfr_set_ui(BEND[e], 0, MPFR_RNDN);
-                    newflats++;
+            /* freeze ladder: classify at descending thresholds; accept only
+               when the certificate passes AND the dropped closure rows are
+               quiet (a wrongly frozen genuine fold shows up there -- the
+               census tail of true folds reaches 4.6e-14, and correct
+               solves measure drop_at <= 2.4e-26) */
+            static const double LADDER[4] = { 1e-8, 1e-11, 1e-14, 0.0 };
+            for (int e = 0; e < NE; e++) mpfr_set(BSAVE[e], BEND[e], MPFR_RNDN);
+            int accepted = 0;
+            for (int li = 0; li < 4 && !accepted; li++) {
+                double tol = LADDER[li];
+                int newflats = 0;
+                for (int e = 0; e < NE; e++) {
+                    mpfr_set(BEND[e], BSAVE[e], MPFR_RNDN);
+                    IS_FLAT[e] = 0;
+                }
+                for (int e = 0; e < NE; e++) {
+                    if (tol > 0 && fabs(mpfr_get_d(BEND[e], MPFR_RNDN)) < tol) {
+                        IS_FLAT[e] = 1;
+                        mpfr_set_ui(BEND[e], 0, MPFR_RNDN);
+                        newflats++;
+                    }
+                }
+                NFREE = 0;
+                for (int e = 0; e < NE; e++)
+                    if (!IS_FLAT[e]) FREE_E[NFREE++] = e;
+                if (newflats > 0 && NFREE > 0) {
+                    if (lm_solve(60) < 0) continue;      /* next rung */
+                }
+                if (certify() != 0) continue;
+                if (CERT_OK && CERT_DROP_AT <= 1e-20) {
+                    PROVE_TOL_USED = tol;
+                    accepted = 1;
                 }
             }
-            NFREE = 0;
-            for (int e = 0; e < NE; e++)
-                if (!IS_FLAT[e]) FREE_E[NFREE++] = e;
-            if (newflats > 0 && NFREE > 0) {
-                if (lm_solve(60) < 0) {
-                    snprintf(errmsg, errmsgsize, "frozen re-solve did not converge");
-                    return 1;
-                }
+            if (!accepted) {
+                snprintf(errmsg, errmsgsize, "certificate failed at every flat threshold");
+                return 1;
             }
-            certify();   /* fills CERT_*; failure is a reported verdict */
         }
     }
     if (PROVE) {
