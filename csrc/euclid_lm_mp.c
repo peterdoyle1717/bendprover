@@ -56,6 +56,9 @@ static const char *SEED_PATH = NULL;   /* lines: a b bend-decimal */
 static int BENDS_ONLY = 0;             /* omit v/f lines from output */
 static int PROVE = 0;                  /* solve, classify, refreeze, certify */
 static double PROVE_FLAT_TOL = 1e-8;
+static int IS_PI[MAXE];                /* pancake case: edges pinned at gem/2 */
+static int PANCAKE = 0;
+static const char *NET_NAME = NULL;
 static int CERT_OK;
 static double CERT_SIG, CERT_H, CERT_RADIUS, CERT_DROP, CERT_ETA,
     CERT_TMIN, CERT_TMAX;
@@ -1028,6 +1031,48 @@ static int certify(void)
     return 0;
 }
 
+/* the adopted record format (see FORMAT.md): halfturn units, certified-
+   pair digits, integer tokens exact, proof internals as a # comment */
+static int write_prove_record(FILE *fp, const char *name, const char *netcode)
+{
+    static mpfr_t PIC, BV, HT;
+    static int init = 0;
+    if (!init) { mpfr_inits2(PREC, PIC, BV, HT, (mpfr_ptr)0); init = 1; }
+    mpfr_const_pi(PIC, MPFR_RNDN);
+    fprintf(fp, "net %s\nv %d\ne %d\nunit halfturns\n", name, NV, NE);
+    if (PANCAKE) {
+        fprintf(fp, "benderr 0\n");
+        fprintf(fp, "faces %s\n", netcode);
+        fprintf(fp, "# proof: degenerate pancake, all bends pinned exactly\n");
+    } else {
+        double r = CERT_OK ? CERT_RADIUS : -1.0;
+        double benderr = CERT_OK ?
+            (2.0 * r / (1.0 - r)) / 3.14159265358979 + 0.5e-36 : -1.0;
+        fprintf(fp, "benderr %.1e\n", benderr);
+        fprintf(fp, "faces %s\n", netcode);
+        fprintf(fp, "# proof: kantorovich at %ld bits, jacobian sigma_min %.3e, "
+                    "h %.3e, turning window [%.9e, %.9e], solver euclid_lm_mp%s%s\n",
+                (long)PREC, CERT_SIG, CERT_H, CERT_TMIN, CERT_TMAX,
+                CERT_OK ? "" : ", CERTIFICATE FAILED: ",
+                CERT_OK ? "" : CERT_WHY);
+    }
+    for (int a = 1; a <= NV; a++)
+        for (int b = a + 1; b <= NV; b++) {
+            int e = EDGE_IDX[a][b];
+            if (e < 0) continue;
+            if (IS_FLAT[e]) { fprintf(fp, "b %d %d 0\n", a, b); continue; }
+            if (PANCAKE)    { fprintf(fp, "b %d %d %d\n", a, b, IS_PI[e]); continue; }
+            /* certified-pair bend: pairs are (cos b/2, -sin b/2) */
+            mpfr_atan2(BV, PS[e], PC[e], MPFR_RNDN);
+            mpfr_mul_si(BV, BV, -2, MPFR_RNDN);
+            mpfr_div(HT, BV, PIC, MPFR_RNDN);
+            mpfr_fprintf(fp, "b %d %d %.36Rf\n", a, b, HT);
+        }
+    fprintf(fp, "end\n");
+    return ferror(fp) ? -1 : 0;
+}
+
+
 /* ---------------- drivers ---------------- */
 
 /* parse "a,b;c,d;..." into IS_FLAT; returns -1 on unknown pair */
@@ -1070,8 +1115,8 @@ static int load_seed(const char *path)
     return 0;
 }
 
-static int solve_one_netcode(const char *netcode, FILE *objout,
-                             char *errmsg, size_t errmsgsize)
+static int solve_one_netcode(const char *netcode, const char *name,
+                             FILE *objout, char *errmsg, size_t errmsgsize)
 {
     static double wish[MAXE];
     if (errmsgsize > 0) errmsg[0] = '\0';
@@ -1091,25 +1136,51 @@ static int solve_one_netcode(const char *netcode, FILE *objout,
     mpfr_div_2ui(TOL, TOL, (unsigned long)(3 * PREC / 4), MPFR_RNDN);
     if (lm_solve(200) < 0) { snprintf(errmsg, errmsgsize, "LM did not converge"); return 1; }
     if (PROVE) {
-        /* classify flats on the converged bends, refreeze, re-solve, certify */
-        int newflats = 0;
+        /* pancake pattern: every bend within tol of 0 or +-gem/2 -> pin all
+           exactly, no certificate needed (exact by construction) */
+        PANCAKE = 1;
+        double dpi = 3.14159265358979323846;
         for (int e = 0; e < NE; e++) {
-            if (!IS_FLAT[e] && fabs(mpfr_get_d(BEND[e], MPFR_RNDN)) < PROVE_FLAT_TOL) {
-                IS_FLAT[e] = 1;
-                mpfr_set_ui(BEND[e], 0, MPFR_RNDN);
-                newflats++;
-            }
+            IS_PI[e] = 0;
+            if (IS_FLAT[e]) continue;
+            double b = mpfr_get_d(BEND[e], MPFR_RNDN);
+            if (fabs(b) < PROVE_FLAT_TOL) continue;
+            if (fabs(fabs(b) - dpi) < PROVE_FLAT_TOL) continue;
+            PANCAKE = 0; break;
         }
-        NFREE = 0;
-        for (int e = 0; e < NE; e++)
-            if (!IS_FLAT[e]) FREE_E[NFREE++] = e;
-        if (newflats > 0 && NFREE > 0) {
-            if (lm_solve(60) < 0) {
-                snprintf(errmsg, errmsgsize, "frozen re-solve did not converge");
-                return 1;
+        if (PANCAKE) {
+            for (int e = 0; e < NE; e++) {
+                double b = mpfr_get_d(BEND[e], MPFR_RNDN);
+                if (!IS_FLAT[e] && fabs(b) < PROVE_FLAT_TOL) IS_FLAT[e] = 1;
+                if (!IS_FLAT[e]) IS_PI[e] = (b > 0) ? 1 : -1;
             }
+        } else {
+            /* classify flats, refreeze, re-solve, certify */
+            int newflats = 0;
+            for (int e = 0; e < NE; e++) {
+                if (!IS_FLAT[e] && fabs(mpfr_get_d(BEND[e], MPFR_RNDN)) < PROVE_FLAT_TOL) {
+                    IS_FLAT[e] = 1;
+                    mpfr_set_ui(BEND[e], 0, MPFR_RNDN);
+                    newflats++;
+                }
+            }
+            NFREE = 0;
+            for (int e = 0; e < NE; e++)
+                if (!IS_FLAT[e]) FREE_E[NFREE++] = e;
+            if (newflats > 0 && NFREE > 0) {
+                if (lm_solve(60) < 0) {
+                    snprintf(errmsg, errmsgsize, "frozen re-solve did not converge");
+                    return 1;
+                }
+            }
+            certify();   /* fills CERT_*; failure is a reported verdict */
         }
-        certify();   /* fills CERT_*; failure is a reported verdict, not an error */
+    }
+    if (PROVE) {
+        if (write_prove_record(objout, name, netcode) < 0) {
+            snprintf(errmsg, errmsgsize, "record write failed"); return 1;
+        }
+        return 0;
     }
     if (!BENDS_ONLY) {
         if (realize() < 0) { snprintf(errmsg, errmsgsize, "realize failed"); return 1; }
@@ -1140,6 +1211,8 @@ int main(int argc, char **argv)
             BENDS_ONLY = 1; argi += 1;
         } else if (strcmp(argv[argi], "--prove") == 0) {
             PROVE = 1; BENDS_ONLY = 1; argi += 1;
+        } else if (strcmp(argv[argi], "--name") == 0) {
+            NET_NAME = argv[argi + 1]; argi += 2;
         } else break;
     }
     while (argi < argc && (strcmp(argv[argi], "--bends-only") == 0 ||
@@ -1153,7 +1226,7 @@ int main(int argc, char **argv)
 
     if (argi < argc && strcmp(argv[argi], "--batch") != 0) {
         char errmsg[512];
-        int rc = solve_one_netcode(argv[argi], stdout, errmsg, sizeof(errmsg));
+        int rc = solve_one_netcode(argv[argi], NET_NAME ? NET_NAME : "-", stdout, errmsg, sizeof(errmsg));
         if (rc != 0) { fprintf(stderr, "%s\n", errmsg[0] ? errmsg : "solver failed"); return 1; }
         return 0;
     }
@@ -1165,9 +1238,15 @@ int main(int argc, char **argv)
             (void)len; chomp(line);
             if (!line[0]) continue;
             char errmsg[512];
-            printf("=== %ld %s\n", idx, line);
-            int rc = solve_one_netcode(line, stdout, errmsg, sizeof(errmsg));
-            printf("=== %ld %s %s\n", idx, rc == 0 ? "ok" : "fail", rc == 0 ? "" : errmsg);
+            char *nm = "-", *nc = line;
+            char *sp = strchr(line, ' ');
+            if (sp) { *sp = '\0'; nm = line; nc = sp + 1; }
+            if (!PROVE) printf("=== %ld %s\n", idx, nc);
+            int rc = solve_one_netcode(nc, nm, stdout, errmsg, sizeof(errmsg));
+            if (!PROVE)
+                printf("=== %ld %s %s\n", idx, rc == 0 ? "ok" : "fail", rc == 0 ? "" : errmsg);
+            else if (rc != 0)
+                printf("# failed %s %s\n", nc, errmsg);
             fails += (rc != 0);
             idx++;
         }
