@@ -54,6 +54,12 @@ static mpfr_prec_t PREC = 128;
 static const char *FLATS_STR = NULL;   /* "a,b;c,d;..." vertex pairs */
 static const char *SEED_PATH = NULL;   /* lines: a b bend-decimal */
 static int BENDS_ONLY = 0;             /* omit v/f lines from output */
+static int PROVE = 0;                  /* solve, classify, refreeze, certify */
+static double PROVE_FLAT_TOL = 1e-8;
+static int CERT_OK;
+static double CERT_SIG, CERT_H, CERT_RADIUS, CERT_DROP, CERT_ETA,
+    CERT_TMIN, CERT_TMAX;
+static const char *CERT_WHY = "";
 
 /* ---------------- topology: identical to euclid_clean.c ---------------- */
 
@@ -551,6 +557,12 @@ static int write_obj(FILE *fp)
 {
     mpfr_fprintf(fp, "# euclid_lm_mp prec=%ld resid=%.3Re iters=%d nflat=%d\n",
                  (long)PREC, NORM, LM_ITERS, NE - NFREE);
+    if (PROVE)
+        fprintf(fp, "# cert ok %d sig_low %.9e h %.6e radius %.6e drop %.6e "
+                    "eta %.6e tmin %.9e tmax %.9e why %s\n",
+                CERT_OK, CERT_SIG, CERT_H, CERT_RADIUS, CERT_DROP,
+                CERT_ETA, CERT_TMIN, CERT_TMAX,
+                CERT_OK ? "-" : CERT_WHY);
     for (int e = 0; e < NE; e++) {
         if (IS_FLAT[e])
             fprintf(fp, "# bend %d %d %d 0 flat\n", e, EDGE_A[e], EDGE_B[e]);
@@ -564,6 +576,456 @@ static int write_obj(FILE *fp)
     for (int fi = 0; fi < NF; fi++)
         fprintf(fp, "f %d %d %d\n", FACES[fi][0], FACES[fi][1], FACES[fi][2]);
     return ferror(fp) ? -1 : 0;
+}
+
+/* ============================================================
+ *   Take-1 certificate (mechanical port of bendprover/mpkernel.py).
+ *
+ *   Pair variables per fold edge e: (c_e, s_e) initialized to
+ *   (cos b_e/2, -sin b_e/2), so the vertex word
+ *       prod over star of T60 (x) (c_e, s_e, 0, 0)   =  eps_v * 1
+ *   is exactly the word the LM solver drove to zero (its q_step is
+ *   q_z(alpha) q_x(-beta)). Unit rows c^2 + s^2 = 1. Newton polish,
+ *   then: numerically selected square row subsystem, Cholesky factor
+ *   witness sigma lower bound, Kantorovich with L = 4*arity^2,
+ *   rounding slop SLOP * ulp per the take-1 model. Radius is in pair
+ *   space; |bend error| <= 2*radius/(1-radius) for radius < 1.
+ * ============================================================ */
+
+#define MAXP (2 * MAXE)
+#define NRMAX (4 * MAXV + MAXE)
+#define CSLOP 64.0
+
+static mpfr_t PC[MAXE], PS[MAXE];          /* pair values per fold edge */
+static int SGN[MAXV + 1];                  /* eps_v */
+static int ACT[MAXV], NACT;                /* active vertices */
+static int FIDX[MAXE];                     /* edge -> fold index, -1 */
+static mpfr_t R2[NRMAX], G2[MAXP], DX2[MAXP];
+static mpfr_t JB[MAXE][2][4][2];           /* fold e, endpoint side, comp, d{c,s} */
+static mpfr_t A2[MAXP][MAXP], C2[MAXP][MAXP], B2[MAXP][MAXP];
+static double JD[NRMAX][MAXP];
+static int SEL[MAXP], INSEL[NRMAX];
+static mpfr_t T60Q[4], QA[4], QB[4], QC[4];
+static mpfr_t PRE[2 * MAXDEG + 2][4], SUF[2 * MAXDEG + 2][4];
+static mpfr_t CT1, CT2, CT3;
+
+static void cert_init_all(void)
+{
+    for (int e = 0; e < MAXE; e++) {
+        mpfr_init2(PC[e], PREC); mpfr_init2(PS[e], PREC);
+        for (int s = 0; s < 2; s++)
+            for (int c = 0; c < 4; c++)
+                for (int k = 0; k < 2; k++) mpfr_init2(JB[e][s][c][k], PREC);
+    }
+    for (int i = 0; i < NRMAX; i++) mpfr_init2(R2[i], PREC);
+    for (int i = 0; i < MAXP; i++) { mpfr_init2(G2[i], PREC); mpfr_init2(DX2[i], PREC); }
+    for (int i = 0; i < MAXP; i++)
+        for (int j = 0; j < MAXP; j++) {
+            mpfr_init2(A2[i][j], PREC); mpfr_init2(C2[i][j], PREC); mpfr_init2(B2[i][j], PREC);
+        }
+    for (int k = 0; k < 4; k++) {
+        mpfr_init2(T60Q[k], PREC); mpfr_init2(QA[k], PREC);
+        mpfr_init2(QB[k], PREC); mpfr_init2(QC[k], PREC);
+    }
+    for (int t = 0; t < 2 * MAXDEG + 2; t++)
+        for (int k = 0; k < 4; k++) { mpfr_init2(PRE[t][k], PREC); mpfr_init2(SUF[t][k], PREC); }
+    mpfr_inits2(PREC, CT1, CT2, CT3, (mpfr_ptr)0);
+    mpfr_sqrt_ui(T60Q[0], 3, MPFR_RNDN); mpfr_div_ui(T60Q[0], T60Q[0], 2, MPFR_RNDN);
+    mpfr_set_ui(T60Q[1], 0, MPFR_RNDN); mpfr_set_ui(T60Q[2], 0, MPFR_RNDN);
+    mpfr_set_d(T60Q[3], 0.5, MPFR_RNDN);
+}
+
+static void pair_word(int v, mpfr_t q[4])
+{
+    mpfr_set_ui(q[0], 1, MPFR_RNDN);
+    for (int k = 1; k < 4; k++) mpfr_set_ui(q[k], 0, MPFR_RNDN);
+    for (int t = 0; t < FLOWER_LEN[v]; t++) {
+        q_mul(q, T60Q, q);
+        int e = FLOWER_E[v][t];
+        if (IS_FLAT[e]) continue;
+        mpfr_set(QC[0], PC[e], MPFR_RNDN); mpfr_set(QC[1], PS[e], MPFR_RNDN);
+        mpfr_set_ui(QC[2], 0, MPFR_RNDN);  mpfr_set_ui(QC[3], 0, MPFR_RNDN);
+        q_mul(q, QC, q);
+    }
+}
+
+static int cert_rows(void)   /* fills R2; returns row count */
+{
+    int r = 0;
+    for (int k = 0; k < NACT; k++) {
+        pair_word(ACT[k], QA);
+        mpfr_sub_si(R2[r + 0], QA[0], SGN[ACT[k]], MPFR_RNDN);
+        mpfr_set(R2[r + 1], QA[1], MPFR_RNDN);
+        mpfr_set(R2[r + 2], QA[2], MPFR_RNDN);
+        mpfr_set(R2[r + 3], QA[3], MPFR_RNDN);
+        r += 4;
+    }
+    for (int f = 0; f < NFREE; f++) {
+        int e = FREE_E[f];
+        mpfr_mul(CT1, PC[e], PC[e], MPFR_RNDN);
+        mpfr_mul(CT2, PS[e], PS[e], MPFR_RNDN);
+        mpfr_add(CT1, CT1, CT2, MPFR_RNDN);
+        mpfr_sub_ui(R2[r], CT1, 1, MPFR_RNDN);
+        r++;
+    }
+    return r;
+}
+
+static void cert_jacobian(void)
+{
+    for (int e = 0; e < NE; e++)
+        for (int s = 0; s < 2; s++)
+            for (int c = 0; c < 4; c++)
+                for (int k = 0; k < 2; k++) mpfr_set_ui(JB[e][s][c][k], 0, MPFR_RNDN);
+    for (int kk = 0; kk < NACT; kk++) {
+        int v = ACT[kk];
+        /* factor list: T60 [pair] T60 [pair] ... */
+        int nf = 0;
+        static int slot_edge[MAXDEG]; int nslot = 0;
+        static int factor_is_pair[2 * MAXDEG];
+        static int factor_edge[2 * MAXDEG];
+        for (int t = 0; t < FLOWER_LEN[v]; t++) {
+            factor_is_pair[nf] = 0; factor_edge[nf] = -1; nf++;
+            int e = FLOWER_E[v][t];
+            if (!IS_FLAT[e]) {
+                factor_is_pair[nf] = 1; factor_edge[nf] = e; nf++;
+                slot_edge[nslot++] = e;
+            }
+        }
+        (void)nslot;
+        mpfr_set_ui(PRE[0][0], 1, MPFR_RNDN);
+        for (int c = 1; c < 4; c++) mpfr_set_ui(PRE[0][c], 0, MPFR_RNDN);
+        for (int t = 0; t < nf; t++) {
+            if (factor_is_pair[t]) {
+                int e = factor_edge[t];
+                mpfr_set(QC[0], PC[e], MPFR_RNDN); mpfr_set(QC[1], PS[e], MPFR_RNDN);
+                mpfr_set_ui(QC[2], 0, MPFR_RNDN);  mpfr_set_ui(QC[3], 0, MPFR_RNDN);
+                q_mul(PRE[t], QC, PRE[t + 1]);
+            } else q_mul(PRE[t], T60Q, PRE[t + 1]);
+        }
+        mpfr_set_ui(SUF[nf][0], 1, MPFR_RNDN);
+        for (int c = 1; c < 4; c++) mpfr_set_ui(SUF[nf][c], 0, MPFR_RNDN);
+        for (int t = nf - 1; t >= 0; t--) {
+            if (factor_is_pair[t]) {
+                int e = factor_edge[t];
+                mpfr_set(QC[0], PC[e], MPFR_RNDN); mpfr_set(QC[1], PS[e], MPFR_RNDN);
+                mpfr_set_ui(QC[2], 0, MPFR_RNDN);  mpfr_set_ui(QC[3], 0, MPFR_RNDN);
+                q_mul(QC, SUF[t + 1], SUF[t]);
+            } else q_mul(T60Q, SUF[t + 1], SUF[t]);
+        }
+        for (int t = 0; t < nf; t++) {
+            if (!factor_is_pair[t]) continue;
+            int e = factor_edge[t];
+            int side = (EDGE_A[e] == v) ? 0 : 1;
+            /* d/dc: pre * suf ; d/ds: pre * (0,1,0,0) * suf */
+            q_mul(PRE[t], SUF[t + 1], QA);
+            mpfr_set_ui(QC[0], 0, MPFR_RNDN); mpfr_set_ui(QC[1], 1, MPFR_RNDN);
+            mpfr_set_ui(QC[2], 0, MPFR_RNDN); mpfr_set_ui(QC[3], 0, MPFR_RNDN);
+            q_mul(PRE[t], QC, QB);
+            q_mul(QB, SUF[t + 1], QB);
+            for (int c = 0; c < 4; c++) {
+                mpfr_add(JB[e][side][c][0], JB[e][side][c][0], QA[c], MPFR_RNDN);
+                mpfr_add(JB[e][side][c][1], JB[e][side][c][1], QB[c], MPFR_RNDN);
+            }
+        }
+    }
+}
+
+/* row structure helpers: active-vertex index per vertex id, fold cols */
+static int ACTIDX[MAXV + 1];
+
+static int row_nonzeros(int row, int *cols, double *valsd, mpfr_ptr *valsm)
+{
+    /* returns nonzero (column, value) entries of J row; values as mpfr
+       pointers (valsm) and doubles (valsd). */
+    int n = 0;
+    if (row < 4 * NACT) {
+        int k = row / 4, comp = row % 4, v = ACT[k];
+        for (int t = 0; t < FLOWER_LEN[v]; t++) {
+            int e = FLOWER_E[v][t];
+            if (IS_FLAT[e]) continue;
+            int side = (EDGE_A[e] == v) ? 0 : 1;
+            int f = FIDX[e];
+            cols[n] = 2 * f;     valsm[n] = JB[e][side][comp][0]; n++;
+            cols[n] = 2 * f + 1; valsm[n] = JB[e][side][comp][1]; n++;
+        }
+    } else {
+        int f = row - 4 * NACT;
+        int e = FREE_E[f];
+        mpfr_mul_ui(CT1, PC[e], 2, MPFR_RNDN);
+        mpfr_mul_ui(CT2, PS[e], 2, MPFR_RNDN);
+        cols[0] = 2 * f;     valsm[0] = CT1;
+        cols[1] = 2 * f + 1; valsm[1] = CT2;
+        n = 2;
+    }
+    for (int i = 0; i < n; i++) valsd[i] = mpfr_get_d(valsm[i], MPFR_RNDN);
+    return n;
+}
+
+static int cert_chol(int n, mpfr_t M[MAXP][MAXP])
+{
+    for (int j = 0; j < n; j++) {
+        for (int k = 0; k < j; k++) {
+            mpfr_mul(CT1, M[j][k], M[j][k], MPFR_RNDN);
+            mpfr_sub(M[j][j], M[j][j], CT1, MPFR_RNDN);
+        }
+        if (mpfr_sgn(M[j][j]) <= 0) return -1;
+        mpfr_sqrt(M[j][j], M[j][j], MPFR_RNDN);
+        for (int i = j + 1; i < n; i++) {
+            for (int k = 0; k < j; k++) {
+                mpfr_mul(CT1, M[i][k], M[j][k], MPFR_RNDN);
+                mpfr_sub(M[i][j], M[i][j], CT1, MPFR_RNDN);
+            }
+            mpfr_div(M[i][j], M[i][j], M[j][j], MPFR_RNDN);
+        }
+    }
+    return 0;
+}
+
+static int certify(void)
+{
+    CERT_OK = 0; CERT_WHY = "";
+    double U = ldexp(1.0, (int)(1 - PREC));
+    /* actives, fold indices, signs, pairs from BEND */
+    NACT = 0;
+    for (int v = 1; v <= NV; v++) {
+        ACTIDX[v] = -1;
+        int any = 0;
+        for (int t = 0; t < FLOWER_LEN[v]; t++)
+            if (!IS_FLAT[FLOWER_E[v][t]]) { any = 1; break; }
+        if (any) { ACTIDX[v] = NACT; ACT[NACT++] = v; }
+    }
+    for (int e = 0; e < NE; e++) FIDX[e] = -1;
+    for (int f = 0; f < NFREE; f++) FIDX[FREE_E[f]] = f;
+    int dmax = 0;
+    for (int k = 0; k < NACT; k++)
+        if (FLOWER_LEN[ACT[k]] > dmax) dmax = FLOWER_LEN[ACT[k]];
+    double arity = 2.0 * dmax + 2.0;
+    for (int f = 0; f < NFREE; f++) {
+        int e = FREE_E[f];
+        mpfr_div_ui(CT1, BEND[e], 2, MPFR_RNDN);
+        mpfr_cos(PC[e], CT1, MPFR_RNDN);
+        mpfr_sin(PS[e], CT1, MPFR_RNDN);
+        mpfr_neg(PS[e], PS[e], MPFR_RNDN);      /* solver convention q_x(-b) */
+    }
+    for (int k = 0; k < NACT; k++) {
+        pair_word(ACT[k], QA);
+        SGN[ACT[k]] = (mpfr_sgn(QA[0]) >= 0) ? 1 : -1;
+    }
+    int ncol = 2 * NFREE;
+    /* Newton polish: full-row normal equations, up to 4 iterations */
+    for (int it = 0; it < 4; it++) {
+        int nrows = cert_rows();
+        double rn = 0;
+        for (int i = 0; i < nrows; i++) {
+            double x = fabs(mpfr_get_d(R2[i], MPFR_RNDN));
+            if (x > rn) rn = x;
+        }
+        if (rn < 1e-33) break;
+        cert_jacobian();
+        for (int p = 0; p < ncol; p++) {
+            mpfr_set_ui(G2[p], 0, MPFR_RNDN);
+            for (int q = p; q < ncol; q++) mpfr_set_ui(A2[p][q], 0, MPFR_RNDN);
+        }
+        int cols[32]; double vd[32]; mpfr_ptr vm[32];
+        for (int i = 0; i < nrows; i++) {
+            int n = row_nonzeros(i, cols, vd, vm);
+            for (int a = 0; a < n; a++) {
+                mpfr_mul(CT3, vm[a], R2[i], MPFR_RNDN);
+                mpfr_add(G2[cols[a]], G2[cols[a]], CT3, MPFR_RNDN);
+                for (int b = a; b < n; b++) {
+                    int p = cols[a] < cols[b] ? cols[a] : cols[b];
+                    int q = cols[a] < cols[b] ? cols[b] : cols[a];
+                    mpfr_mul(CT3, vm[a], vm[b], MPFR_RNDN);
+                    mpfr_add(A2[p][q], A2[p][q], CT3, MPFR_RNDN);
+                }
+            }
+        }
+        for (int p = 0; p < ncol; p++)
+            for (int q = 0; q < p; q++) mpfr_set(A2[p][q], A2[q][p], MPFR_RNDN);
+        for (int p = 0; p < ncol; p++)
+            for (int q = 0; q <= p; q++) mpfr_set(C2[p][q], A2[p][q], MPFR_RNDN);
+        if (cert_chol(ncol, C2) != 0) { CERT_WHY = "newton chol failed"; return -1; }
+        for (int i = 0; i < ncol; i++) {             /* solve C2 C2^T dx = g */
+            mpfr_set(DX2[i], G2[i], MPFR_RNDN);
+            for (int k = 0; k < i; k++) {
+                mpfr_mul(CT1, C2[i][k], DX2[k], MPFR_RNDN);
+                mpfr_sub(DX2[i], DX2[i], CT1, MPFR_RNDN);
+            }
+            mpfr_div(DX2[i], DX2[i], C2[i][i], MPFR_RNDN);
+        }
+        for (int i = ncol - 1; i >= 0; i--) {
+            for (int k = i + 1; k < ncol; k++) {
+                mpfr_mul(CT1, C2[k][i], DX2[k], MPFR_RNDN);
+                mpfr_sub(DX2[i], DX2[i], CT1, MPFR_RNDN);
+            }
+            mpfr_div(DX2[i], DX2[i], C2[i][i], MPFR_RNDN);
+        }
+        for (int f = 0; f < NFREE; f++) {
+            int e = FREE_E[f];
+            mpfr_sub(PC[e], PC[e], DX2[2 * f], MPFR_RNDN);
+            mpfr_sub(PS[e], PS[e], DX2[2 * f + 1], MPFR_RNDN);
+        }
+    }
+    /* final residual + jacobian, row selection in doubles */
+    int nrows = cert_rows();
+    cert_jacobian();
+    {
+        int cols[32]; double vd[32]; mpfr_ptr vm[32];
+        for (int i = 0; i < nrows; i++) {
+            for (int j = 0; j < ncol; j++) JD[i][j] = 0.0;
+            int n = row_nonzeros(i, cols, vd, vm);
+            for (int a = 0; a < n; a++) JD[i][cols[a]] = vd[a];
+        }
+    }
+    {
+        static int left[NRMAX]; int nleft = nrows;
+        for (int i = 0; i < nrows; i++) { left[i] = i; INSEL[i] = 0; }
+        for (int c = 0; c < ncol; c++) {
+            int piv = -1; double pv = 1e-9;
+            for (int li = 0; li < nleft; li++) {
+                double x = fabs(JD[left[li]][c]);
+                if (x > pv) { pv = x; piv = li; }
+            }
+            if (piv < 0) { CERT_WHY = "row selection failed"; return -1; }
+            int prow = left[piv];
+            SEL[c] = prow; INSEL[prow] = 1;
+            left[piv] = left[--nleft];
+            double inv = 1.0 / JD[prow][c];
+            for (int li = 0; li < nleft; li++) {
+                int r = left[li];
+                double fac = JD[r][c] * inv;
+                if (fac != 0.0)
+                    for (int j = c; j < ncol; j++) JD[r][j] -= fac * JD[prow][j];
+            }
+        }
+    }
+    /* A = Js^T Js from selected rows (recomputed in mpfr) */
+    for (int p = 0; p < ncol; p++)
+        for (int q = p; q < ncol; q++) mpfr_set_ui(A2[p][q], 0, MPFR_RNDN);
+    double amax = 0.0;
+    {
+        int cols[32]; double vd[32]; mpfr_ptr vm[32];
+        for (int c = 0; c < ncol; c++) {
+            int i = SEL[c];
+            int n = row_nonzeros(i, cols, vd, vm);
+            for (int a = 0; a < n; a++)
+                for (int b = a; b < n; b++) {
+                    int p = cols[a] < cols[b] ? cols[a] : cols[b];
+                    int q = cols[a] < cols[b] ? cols[b] : cols[a];
+                    mpfr_mul(CT3, vm[a], vm[b], MPFR_RNDN);
+                    mpfr_add(A2[p][q], A2[p][q], CT3, MPFR_RNDN);
+                }
+        }
+        for (int p = 0; p < ncol; p++)
+            for (int q = 0; q < p; q++) mpfr_set(A2[p][q], A2[q][p], MPFR_RNDN);
+        for (int p = 0; p < ncol; p++)
+            for (int q = 0; q < ncol; q++) {
+                double x = fabs(mpfr_get_d(A2[p][q], MPFR_RNDN));
+                if (x > amax) amax = x;
+            }
+    }
+    double EA = CSLOP * ncol * U * (amax + 1.0) * ncol;
+    for (int p = 0; p < ncol; p++)
+        for (int q = 0; q <= p; q++) mpfr_set(C2[p][q], A2[p][q], MPFR_RNDN);
+    if (cert_chol(ncol, C2) != 0) { CERT_WHY = "cert chol failed"; return -1; }
+    /* B = C^-1 (lower) */
+    for (int i = 0; i < ncol; i++) {
+        mpfr_ui_div(B2[i][i], 1, C2[i][i], MPFR_RNDN);
+        for (int j = 0; j < i; j++) {
+            mpfr_set_ui(CT2, 0, MPFR_RNDN);
+            for (int k = j; k < i; k++) {
+                mpfr_mul(CT1, C2[i][k], B2[k][j], MPFR_RNDN);
+                mpfr_add(CT2, CT2, CT1, MPFR_RNDN);
+            }
+            mpfr_div(CT2, CT2, C2[i][i], MPFR_RNDN);
+            mpfr_neg(B2[i][j], CT2, MPFR_RNDN);
+        }
+    }
+    /* delta = ||B C - I||_F, bnorm = ||B||_F */
+    mpfr_set_ui(CT2, 0, MPFR_RNDN);          /* dsum */
+    for (int i = 0; i < ncol; i++)
+        for (int j = 0; j <= i; j++) {
+            mpfr_set_ui(CT3, 0, MPFR_RNDN);
+            for (int k = j; k <= i; k++) {
+                mpfr_mul(CT1, B2[i][k], C2[k][j], MPFR_RNDN);
+                mpfr_add(CT3, CT3, CT1, MPFR_RNDN);
+            }
+            if (i == j) mpfr_sub_ui(CT3, CT3, 1, MPFR_RNDN);
+            mpfr_mul(CT3, CT3, CT3, MPFR_RNDN);
+            mpfr_add(CT2, CT2, CT3, MPFR_RNDN);
+        }
+    mpfr_sqrt(CT2, CT2, MPFR_RNDN);
+    double delta = mpfr_get_d(CT2, MPFR_RNDU) + CSLOP * ncol * ncol * U;
+    mpfr_set_ui(CT2, 0, MPFR_RNDN);
+    for (int i = 0; i < ncol; i++)
+        for (int j = 0; j <= i; j++) {
+            mpfr_mul(CT1, B2[i][j], B2[i][j], MPFR_RNDN);
+            mpfr_add(CT2, CT2, CT1, MPFR_RNDN);
+        }
+    mpfr_sqrt(CT2, CT2, MPFR_RNDN);
+    double bnorm = mpfr_get_d(CT2, MPFR_RNDU);
+    if (delta >= 1.0) { CERT_WHY = "witness delta>=1"; return -1; }
+    double sigC = (1.0 - delta) / bnorm;
+    /* rhoA = ||A - C C^T||_F + slops */
+    mpfr_set_ui(CT2, 0, MPFR_RNDN);
+    for (int i = 0; i < ncol; i++)
+        for (int j = 0; j <= i; j++) {
+            mpfr_set(CT3, A2[i][j], MPFR_RNDN);
+            int kmax = (i < j ? i : j);
+            for (int k = 0; k <= kmax; k++) {
+                mpfr_mul(CT1, C2[i][k], C2[j][k], MPFR_RNDN);
+                mpfr_sub(CT3, CT3, CT1, MPFR_RNDN);
+            }
+            mpfr_mul(CT3, CT3, CT3, MPFR_RNDN);
+            if (i != j) mpfr_mul_ui(CT3, CT3, 2, MPFR_RNDN);
+            mpfr_add(CT2, CT2, CT3, MPFR_RNDN);
+        }
+    mpfr_sqrt(CT2, CT2, MPFR_RNDN);
+    double rhoA = mpfr_get_d(CT2, MPFR_RNDU) + CSLOP * ncol * ncol * U + EA;
+    double margin = sigC * sigC - rhoA;
+    if (margin <= 0.0) { CERT_WHY = "sigma margin<=0"; return -1; }
+    double sig_low = sqrt(margin);
+    /* selected residual norm */
+    mpfr_set_ui(CT2, 0, MPFR_RNDN);
+    for (int c = 0; c < ncol; c++) {
+        mpfr_mul(CT1, R2[SEL[c]], R2[SEL[c]], MPFR_RNDN);
+        mpfr_add(CT2, CT2, CT1, MPFR_RNDN);
+    }
+    mpfr_sqrt(CT2, CT2, MPFR_RNDN);
+    double rnorm = mpfr_get_d(CT2, MPFR_RNDU) + CSLOP * ncol * arity * U;
+    double beta = 1.0 / sig_low;
+    double L = 4.0 * arity * arity;
+    double eta = beta * rnorm;
+    double h = beta * L * eta;
+    if (!(h < 0.5)) { CERT_WHY = "kantorovich h>=1/2"; return -1; }
+    /* stable form of (1 - sqrt(1-2h))/(beta L) for tiny h */
+    double radius = 2.0 * eta / (1.0 + sqrt(1.0 - 2.0 * h));
+    double drop_at = 0.0;
+    for (int i = 0; i < nrows; i++) {
+        if (INSEL[i]) continue;
+        double x = fabs(mpfr_get_d(R2[i], MPFR_RNDN));
+        if (x > drop_at) drop_at = x;
+    }
+    double drop = drop_at + CSLOP * arity * U + arity * radius;
+    /* neoconvex window on the emitted bends, margin deg*2*radius */
+    double tmin = 1e300, tmax = -1e300; int anyt = 0;
+    for (int v = 1; v <= NV; v++) {
+        if (ACTIDX[v] < 0) continue;
+        double T = 0.0;
+        for (int t = 0; t < FLOWER_LEN[v]; t++) {
+            int e = FLOWER_E[v][t];
+            if (!IS_FLAT[e]) T += mpfr_get_d(BEND[e], MPFR_RNDN);
+        }
+        double m = FLOWER_LEN[v] * 2.0 * radius + 1e-15;
+        if (T - m < tmin) tmin = T - m;
+        if (T + m > tmax) tmax = T + m;
+        anyt = 1;
+    }
+    CERT_OK = 1; CERT_SIG = sig_low; CERT_H = h; CERT_RADIUS = radius;
+    CERT_DROP = drop; CERT_ETA = eta;
+    CERT_TMIN = anyt ? tmin : 0.0; CERT_TMAX = anyt ? tmax : 0.0;
+    return 0;
 }
 
 /* ---------------- drivers ---------------- */
@@ -628,7 +1090,30 @@ static int solve_one_netcode(const char *netcode, FILE *objout,
     mpfr_set_ui(TOL, 1, MPFR_RNDN);
     mpfr_div_2ui(TOL, TOL, (unsigned long)(3 * PREC / 4), MPFR_RNDN);
     if (lm_solve(200) < 0) { snprintf(errmsg, errmsgsize, "LM did not converge"); return 1; }
-    if (realize() < 0) { snprintf(errmsg, errmsgsize, "realize failed"); return 1; }
+    if (PROVE) {
+        /* classify flats on the converged bends, refreeze, re-solve, certify */
+        int newflats = 0;
+        for (int e = 0; e < NE; e++) {
+            if (!IS_FLAT[e] && fabs(mpfr_get_d(BEND[e], MPFR_RNDN)) < PROVE_FLAT_TOL) {
+                IS_FLAT[e] = 1;
+                mpfr_set_ui(BEND[e], 0, MPFR_RNDN);
+                newflats++;
+            }
+        }
+        NFREE = 0;
+        for (int e = 0; e < NE; e++)
+            if (!IS_FLAT[e]) FREE_E[NFREE++] = e;
+        if (newflats > 0 && NFREE > 0) {
+            if (lm_solve(60) < 0) {
+                snprintf(errmsg, errmsgsize, "frozen re-solve did not converge");
+                return 1;
+            }
+        }
+        certify();   /* fills CERT_*; failure is a reported verdict, not an error */
+    }
+    if (!BENDS_ONLY) {
+        if (realize() < 0) { snprintf(errmsg, errmsgsize, "realize failed"); return 1; }
+    }
     if (write_obj(objout) < 0) { snprintf(errmsg, errmsgsize, "OBJ write failed"); return 1; }
     return 0;
 }
@@ -653,10 +1138,18 @@ int main(int argc, char **argv)
             SEED_PATH = argv[argi + 1]; argi += 2;
         } else if (strcmp(argv[argi], "--bends-only") == 0) {
             BENDS_ONLY = 1; argi += 1;
+        } else if (strcmp(argv[argi], "--prove") == 0) {
+            PROVE = 1; BENDS_ONLY = 1; argi += 1;
         } else break;
     }
-    if (argi < argc && strcmp(argv[argi], "--bends-only") == 0) { BENDS_ONLY = 1; argi++; }
+    while (argi < argc && (strcmp(argv[argi], "--bends-only") == 0 ||
+                           strcmp(argv[argi], "--prove") == 0)) {
+        if (strcmp(argv[argi], "--prove") == 0) { PROVE = 1; BENDS_ONLY = 1; }
+        else BENDS_ONLY = 1;
+        argi++;
+    }
     mp_init_all();
+    if (PROVE) cert_init_all();
 
     if (argi < argc && strcmp(argv[argi], "--batch") != 0) {
         char errmsg[512];
