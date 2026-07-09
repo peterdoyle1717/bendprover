@@ -54,6 +54,9 @@ static mpfr_prec_t PREC = 128;
 static const char *FLATS_STR = NULL;   /* "a,b;c,d;..." vertex pairs */
 static const char *SEED_PATH = NULL;   /* lines: a b bend-decimal */
 static int NOGATE = 0;                 /* --nogate: LM without the dent gate */
+static const char *DENTS_STR = NULL;   /* --dents "v1,v2": these must stay dented */
+static int DENT_REQ[MAXV + 1];
+static int NDENTREQ = 0;
 static int BENDS_ONLY = 0;             /* omit v/f lines from output */
 static int PROVE = 0;                  /* solve, classify, refreeze, certify */
 static double PROVE_FLAT_TOL = 1e-8;
@@ -423,6 +426,37 @@ static int has_dent(mpfr_t *bend)
     return 0;
 }
 
+/* --dents gate: every listed vertex must have negative turning; other
+   vertices are unconstrained. Returns a violating vertex or 0. */
+static int dents_gate_bad(mpfr_t *bend)
+{
+    for (int v = 1; v <= NV; v++) {
+        if (!DENT_REQ[v]) continue;
+        mpfr_set_ui(T2, 0, MPFR_RNDN);
+        for (int t = 0; t < FLOWER_LEN[v]; t++)
+            mpfr_add(T2, T2, bend[FLOWER_E[v][t]], MPFR_RNDN);
+        if (mpfr_sgn(T2) >= 0) return v;
+    }
+    return 0;
+}
+
+static int parse_dents(const char *str)
+{
+    for (int v = 0; v <= MAXV; v++) DENT_REQ[v] = 0;
+    NDENTREQ = 0;
+    if (!str) return 0;
+    const char *p = str;
+    while (*p) {
+        int v;
+        if (sscanf(p, "%d", &v) != 1) return -1;
+        if (v < 1 || v > NV) return -1;
+        DENT_REQ[v] = 1; NDENTREQ++;
+        while (*p && *p != ',') p++;
+        if (*p == ',') p++;
+    }
+    return 0;
+}
+
 static int LM_ITERS = 0;
 
 static int lm_solve(int maxiter)
@@ -452,11 +486,14 @@ static int lm_solve(int maxiter)
             for (int e = 0; e < NE; e++) mpfr_set(BEND_T[e], BEND[e], MPFR_RNDN);
             for (int pf = 0; pf < NFREE; pf++)
                 mpfr_add(BEND_T[FREE_E[pf]], BEND[FREE_E[pf]], DELTA[pf], MPFR_RNDN);
-            int dent_v = has_dent(BEND_T);
+            int gate_bad;
+            if (NOGATE)            gate_bad = 0;
+            else if (NDENTREQ)     gate_bad = dents_gate_bad(BEND_T);
+            else                   gate_bad = has_dent(BEND_T);
             residual(BEND_T, RT_BUF);
             vec_norm2(NTRIAL, RT_BUF, rows);
 
-            if (mpfr_cmp(NTRIAL, NORM) < 0 && (NOGATE || dent_v == 0)) {
+            if (mpfr_cmp(NTRIAL, NORM) < 0 && gate_bad == 0) {
                 for (int e = 0; e < NE; e++) mpfr_set(BEND[e], BEND_T[e], MPFR_RNDN);
                 for (int i = 0; i < rows; i++) mpfr_set(R_BUF[i], RT_BUF[i], MPFR_RNDN);
                 mpfr_set(NORM, NTRIAL, MPFR_RNDN);
@@ -1131,6 +1168,7 @@ static int solve_one_netcode(const char *netcode, const char *name,
     if (parse_netcode(netcode) <= 0) { snprintf(errmsg, errmsgsize, "parse failed"); return 1; }
     if (build_topology() < 0) { snprintf(errmsg, errmsgsize, "build_topology failed"); return 1; }
     if (parse_flats(FLATS_STR) < 0) { snprintf(errmsg, errmsgsize, "bad --flats"); return 1; }
+    if (parse_dents(DENTS_STR) < 0) { snprintf(errmsg, errmsgsize, "bad --dents"); return 1; }
     if (wish_init_double(wish) < 0) { snprintf(errmsg, errmsgsize, "wish_init failed"); return 1; }
     for (int e = 0; e < NE; e++)
         mpfr_set_d(BEND[e], IS_FLAT[e] ? 0.0 : wish[e], MPFR_RNDN);
@@ -1168,15 +1206,25 @@ static int solve_one_netcode(const char *netcode, const char *name,
                quiet (a wrongly frozen genuine fold shows up there -- the
                census tail of true folds reaches 4.6e-14, and correct
                solves measure drop_at <= 2.4e-26) */
+            /* explicit --flats: trust the given flat set as the only rung
+               (the ladder's threshold classification cannot separate exact
+               zeros from genuine folds below 1e-8, e.g. the 00x00x lune
+               nets whose fold tail reaches 1e-12) */
             static const double LADDER[4] = { 1e-8, 1e-11, 1e-14, 0.0 };
             for (int e = 0; e < NE; e++) mpfr_set(BSAVE[e], BEND[e], MPFR_RNDN);
             int accepted = 0;
-            for (int li = 0; li < 4 && !accepted; li++) {
-                double tol = LADDER[li];
+            int nrungs = FLATS_STR ? 1 : 4;
+            for (int li = 0; li < nrungs && !accepted; li++) {
+                double tol = FLATS_STR ? -1 : LADDER[li];
                 int newflats = 0;
                 for (int e = 0; e < NE; e++) {
                     mpfr_set(BEND[e], BSAVE[e], MPFR_RNDN);
-                    IS_FLAT[e] = 0;
+                    if (!FLATS_STR) IS_FLAT[e] = 0;
+                }
+                if (FLATS_STR) {
+                    for (int e = 0; e < NE; e++)
+                        if (IS_FLAT[e]) { mpfr_set_ui(BEND[e], 0, MPFR_RNDN); newflats++; }
+                    PROVE_TOL_USED = -1;
                 }
                 for (int e = 0; e < NE; e++) {
                     if (tol > 0 && fabs(mpfr_get_d(BEND[e], MPFR_RNDN)) < tol) {
@@ -1189,9 +1237,17 @@ static int solve_one_netcode(const char *netcode, const char *name,
                 for (int e = 0; e < NE; e++)
                     if (!IS_FLAT[e]) FREE_E[NFREE++] = e;
                 if (newflats > 0 && NFREE > 0) {
-                    if (lm_solve(60) < 0) continue;      /* next rung */
+                    if (lm_solve(60) < 0) {
+                        if (getenv("LADDER_DEBUG"))
+                            fprintf(stderr, "rung %.0e: %d flats, lm_solve FAILED\n", tol, newflats);
+                        continue;      /* next rung */
+                    }
                 }
-                if (certify() != 0) continue;
+                int crc = certify();
+                if (getenv("LADDER_DEBUG"))
+                    fprintf(stderr, "rung %.0e: %d flats, certify rc=%d ok=%d drop_at=%.3e\n",
+                            tol, newflats, crc, CERT_OK, CERT_DROP_AT);
+                if (crc != 0) continue;
                 if (CERT_OK && CERT_DROP_AT <= 1e-20) {
                     PROVE_TOL_USED = tol;
                     accepted = 1;
@@ -1236,6 +1292,8 @@ int main(int argc, char **argv)
             SEED_PATH = argv[argi + 1]; argi += 2;
         } else if (strcmp(argv[argi], "--nogate") == 0) {
             NOGATE = 1; argi += 1;
+        } else if (strcmp(argv[argi], "--dents") == 0) {
+            DENTS_STR = argv[argi + 1]; argi += 2;
         } else if (strcmp(argv[argi], "--bends-only") == 0) {
             BENDS_ONLY = 1; argi += 1;
         } else if (strcmp(argv[argi], "--prove") == 0) {
