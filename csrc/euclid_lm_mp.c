@@ -53,6 +53,7 @@ static int NFREE;
 static mpfr_prec_t PREC = 128;
 static const char *FLATS_STR = NULL;   /* "a,b;c,d;..." vertex pairs */
 static const char *SEED_PATH = NULL;   /* lines: a b bend-decimal */
+static int NOGATE = 0;                 /* --nogate: LM without the dent gate */
 static int BENDS_ONLY = 0;             /* omit v/f lines from output */
 static int PROVE = 0;                  /* solve, classify, refreeze, certify */
 static double PROVE_FLAT_TOL = 1e-8;
@@ -455,7 +456,7 @@ static int lm_solve(int maxiter)
             residual(BEND_T, RT_BUF);
             vec_norm2(NTRIAL, RT_BUF, rows);
 
-            if (mpfr_cmp(NTRIAL, NORM) < 0 && dent_v == 0) {
+            if (mpfr_cmp(NTRIAL, NORM) < 0 && (NOGATE || dent_v == 0)) {
                 for (int e = 0; e < NE; e++) mpfr_set(BEND[e], BEND_T[e], MPFR_RNDN);
                 for (int i = 0; i < rows; i++) mpfr_set(R_BUF[i], RT_BUF[i], MPFR_RNDN);
                 mpfr_set(NORM, NTRIAL, MPFR_RNDN);
@@ -1233,6 +1234,8 @@ int main(int argc, char **argv)
             FLATS_STR = argv[argi + 1]; argi += 2;
         } else if (strcmp(argv[argi], "--seed") == 0) {
             SEED_PATH = argv[argi + 1]; argi += 2;
+        } else if (strcmp(argv[argi], "--nogate") == 0) {
+            NOGATE = 1; argi += 1;
         } else if (strcmp(argv[argi], "--bends-only") == 0) {
             BENDS_ONLY = 1; argi += 1;
         } else if (strcmp(argv[argi], "--prove") == 0) {
