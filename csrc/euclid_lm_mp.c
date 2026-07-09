@@ -54,6 +54,8 @@ static mpfr_prec_t PREC = 128;
 static const char *FLATS_STR = NULL;   /* "a,b;c,d;..." vertex pairs */
 static const char *SEED_PATH = NULL;   /* lines: a b bend-decimal */
 static int NOGATE = 0;                 /* --nogate: LM without the dent gate */
+static double ALPHA_DEG = 60.0;        /* --alpha: corner angle in degrees; 60 = Euclidean,
+                                          smaller = hyperbolic, -> 0 = ideal */
 static const char *DENTS_STR = NULL;   /* --dents "v1,v2": these must stay dented */
 static int DENT_REQ[MAXV + 1];
 static int NDENTREQ = 0;
@@ -692,9 +694,16 @@ static void cert_init_all(void)
         for (int k = 0; k < 4; k++) { mpfr_init2(PRE[t][k], PREC); mpfr_init2(SUF[t][k], PREC); }
     mpfr_inits2(PREC, CT1, CT2, CT3, (mpfr_ptr)0);
     for (int e = 0; e < MAXE; e++) mpfr_init2(BSAVE[e], PREC);
-    mpfr_sqrt_ui(T60Q[0], 3, MPFR_RNDN); mpfr_div_ui(T60Q[0], T60Q[0], 2, MPFR_RNDN);
+}
+
+/* step quaternion for the corner angle: (cos(a/2), 0, 0, sin(a/2));
+   called after ALPHA is set for the current solve */
+static void set_step_quat(void)
+{
+    mpfr_div_ui(CT1, ALPHA, 2, MPFR_RNDN);
+    mpfr_cos(T60Q[0], CT1, MPFR_RNDN);
     mpfr_set_ui(T60Q[1], 0, MPFR_RNDN); mpfr_set_ui(T60Q[2], 0, MPFR_RNDN);
-    mpfr_set_d(T60Q[3], 0.5, MPFR_RNDN);
+    mpfr_sin(T60Q[3], CT1, MPFR_RNDN);
 }
 
 static void pair_word(int v, mpfr_t q[4])
@@ -1100,6 +1109,8 @@ static int write_prove_record(FILE *fp, const char *name, const char *netcode)
     if (!init) { mpfr_inits2(PREC, PIC, BV, HT, (mpfr_ptr)0); init = 1; }
     mpfr_const_pi(PIC, MPFR_RNDN);
     fprintf(fp, "net %s\nv %d\ne %d\nunit halfturns\n", name, NV, NE);
+    if (ALPHA_DEG != 60.0)
+        fprintf(fp, "alpha %.17g degrees\n", ALPHA_DEG);
     if (PANCAKE) {
         fprintf(fp, "benderr 0\n");
         fprintf(fp, "faces %s\n", netcode);
@@ -1193,7 +1204,9 @@ static int solve_one_netcode(const char *netcode, const char *name,
         snprintf(errmsg, errmsgsize, "bad --seed"); return 1;
     }
     mpfr_const_pi(ALPHA, MPFR_RNDN);
-    mpfr_div_ui(ALPHA, ALPHA, 3, MPFR_RNDN);
+    mpfr_mul_d(ALPHA, ALPHA, ALPHA_DEG, MPFR_RNDN);
+    mpfr_div_ui(ALPHA, ALPHA, 180, MPFR_RNDN);
+    if (PROVE) set_step_quat();       /* cert buffers exist only under --prove */
     /* tol = 2^(-3*prec/4): ~1e-29 at 128 bits */
     mpfr_set_ui(TOL, 1, MPFR_RNDN);
     mpfr_div_2ui(TOL, TOL, (unsigned long)(3 * PREC / 4), MPFR_RNDN);
@@ -1309,6 +1322,12 @@ int main(int argc, char **argv)
             SEED_PATH = argv[argi + 1]; argi += 2;
         } else if (strcmp(argv[argi], "--nogate") == 0) {
             NOGATE = 1; argi += 1;
+        } else if (strcmp(argv[argi], "--alpha") == 0) {
+            ALPHA_DEG = atof(argv[argi + 1]); argi += 2;
+            if (!(ALPHA_DEG > 0.0 && ALPHA_DEG <= 60.0)) {
+                fprintf(stderr, "--alpha must be in (0, 60]\n");
+                return 2;
+            }
         } else if (strcmp(argv[argi], "--dents") == 0) {
             DENTS_STR = argv[argi + 1]; argi += 2;
         } else if (strcmp(argv[argi], "--dents-exact") == 0) {
