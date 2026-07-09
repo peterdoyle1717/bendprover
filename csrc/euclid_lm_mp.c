@@ -155,7 +155,10 @@ static int wish_init_double(double *wish)
             if (EDGE_IDX[lo][hi] >= 0) M[i - 1][j - 1] = 1.0;
         }
     }
-    for (int i = 0; i < NV; i++) M[i][NV] = -2.0;
+    /* per-vertex turning target: +gem, or -gem at --dents vertices, so
+       the wish is the L2-min bend vector for the requested sign pattern
+       (the undented pipeline is the all-plus special case) */
+    for (int i = 0; i < NV; i++) M[i][NV] = DENT_REQ[i + 1] ? 2.0 : -2.0;
     for (int e = 0; e < NE; e++) {
         M[EDGE_A[e] - 1][NV] += g[e];
         M[EDGE_B[e] - 1][NV] += g[e];
