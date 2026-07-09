@@ -57,6 +57,7 @@ static int NOGATE = 0;                 /* --nogate: LM without the dent gate */
 static const char *DENTS_STR = NULL;   /* --dents "v1,v2": these must stay dented */
 static int DENT_REQ[MAXV + 1];
 static int NDENTREQ = 0;
+static int DENTS_EXACT = 0;            /* --dents-exact: T<0 on listed, T>=0 off */
 static int BENDS_ONLY = 0;             /* omit v/f lines from output */
 static int PROVE = 0;                  /* solve, classify, refreeze, certify */
 static double PROVE_FLAT_TOL = 1e-8;
@@ -427,15 +428,25 @@ static int has_dent(mpfr_t *bend)
 }
 
 /* --dents gate: every listed vertex must have negative turning; other
-   vertices are unconstrained. Returns a violating vertex or 0. */
+   vertices are unconstrained -- unless DENTS_EXACT, in which case
+   unlisted vertices must have T >= 0 (the full sign pattern).
+   Returns a violating vertex or 0. */
 static int dents_gate_bad(mpfr_t *bend)
 {
+    if (DENTS_EXACT) {
+        /* principal branch: no fold past a halfturn (|b| < pi); a bend
+           beyond shut is never embedded and lets the unwrapped turning
+           diverge from the record's */
+        mpfr_const_pi(T2, MPFR_RNDN);
+        for (int e = 0; e < NE; e++)
+            if (mpfr_cmpabs(bend[e], T2) >= 0) return NV + 1 + e;
+    }
     for (int v = 1; v <= NV; v++) {
-        if (!DENT_REQ[v]) continue;
         mpfr_set_ui(T2, 0, MPFR_RNDN);
         for (int t = 0; t < FLOWER_LEN[v]; t++)
             mpfr_add(T2, T2, bend[FLOWER_E[v][t]], MPFR_RNDN);
-        if (mpfr_sgn(T2) >= 0) return v;
+        if (DENT_REQ[v]) { if (mpfr_sgn(T2) >= 0) return v; }
+        else if (DENTS_EXACT) { if (mpfr_sgn(T2) < 0) return v; }
     }
     return 0;
 }
@@ -487,9 +498,9 @@ static int lm_solve(int maxiter)
             for (int pf = 0; pf < NFREE; pf++)
                 mpfr_add(BEND_T[FREE_E[pf]], BEND[FREE_E[pf]], DELTA[pf], MPFR_RNDN);
             int gate_bad;
-            if (NOGATE)            gate_bad = 0;
-            else if (NDENTREQ)     gate_bad = dents_gate_bad(BEND_T);
-            else                   gate_bad = has_dent(BEND_T);
+            if (NOGATE)                        gate_bad = 0;
+            else if (NDENTREQ || DENTS_EXACT)  gate_bad = dents_gate_bad(BEND_T);
+            else                               gate_bad = has_dent(BEND_T);
             residual(BEND_T, RT_BUF);
             vec_norm2(NTRIAL, RT_BUF, rows);
 
@@ -1294,6 +1305,8 @@ int main(int argc, char **argv)
             NOGATE = 1; argi += 1;
         } else if (strcmp(argv[argi], "--dents") == 0) {
             DENTS_STR = argv[argi + 1]; argi += 2;
+        } else if (strcmp(argv[argi], "--dents-exact") == 0) {
+            DENTS_EXACT = 1; argi += 1;
         } else if (strcmp(argv[argi], "--bends-only") == 0) {
             BENDS_ONLY = 1; argi += 1;
         } else if (strcmp(argv[argi], "--prove") == 0) {
