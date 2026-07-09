@@ -445,7 +445,10 @@ static int dents_gate_bad(mpfr_t *bend)
         mpfr_set_ui(T2, 0, MPFR_RNDN);
         for (int t = 0; t < FLOWER_LEN[v]; t++)
             mpfr_add(T2, T2, bend[FLOWER_E[v][t]], MPFR_RNDN);
-        if (DENT_REQ[v]) { if (mpfr_sgn(T2) >= 0) return v; }
+        /* closed orthant: listed vertices T <= 0, unlisted T >= 0; an
+           exactly flat vertex passes both signs (dents of flat vertices
+           are in the eye of the beholder) */
+        if (DENT_REQ[v]) { if (mpfr_sgn(T2) > 0) return v; }
         else if (DENTS_EXACT) { if (mpfr_sgn(T2) < 0) return v; }
     }
     return 0;
