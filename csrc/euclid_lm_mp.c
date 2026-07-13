@@ -30,7 +30,7 @@
 #include <unistd.h>
 #include <mpfr.h>
 
-#define MAXV 128
+#define MAXV 512
 #define MAXF (2 * MAXV + 4)
 #define MAXE (3 * MAXV + 6)
 #define MAXDEG 16
