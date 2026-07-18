@@ -30,7 +30,9 @@
 #include <unistd.h>
 #include <mpfr.h>
 
-#define MAXV 512
+#ifndef MAXV
+#define MAXV 2048   /* override: -DMAXV=... */
+#endif
 #define MAXF (2 * MAXV + 4)
 #define MAXE (3 * MAXV + 6)
 #define MAXDEG 16
@@ -193,8 +195,10 @@ typedef mpfr_t Quat[4];
 static mpfr_t BEND[MAXE], BEND_T[MAXE];
 static mpfr_t R_BUF[3 * MAXV], RT_BUF[3 * MAXV];
 static mpfr_t JCOL[MAXE][6];      /* column e: 3 rows at EDGE_A, 3 at EDGE_B */
-static mpfr_t A_BUF[MAXE][MAXE];  /* J^T J (+ lambda D on the copy) */
-static mpfr_t M_BUF[MAXE][MAXE];
+static mpfr_t (*A_BUF)[MAXE];  /* J^T J (+ lambda D); heap: MAXE x MAXE
+                                  static BSS would break the linker at
+                                  MAXV 2048; pages are touched lazily */
+static mpfr_t (*M_BUF)[MAXE];
 static mpfr_t G_BUF[MAXE], D_BUF[MAXE], DELTA[MAXE];
 static mpfr_t VXYZ[MAXV + 1][3];
 static mpfr_t ALPHA, T1, T2, T3, T4, NORM, NTRIAL, LAMBDA, TOL;
@@ -202,18 +206,41 @@ static Quat QTMP1, QTMP2, QSTEP, QD;
 static Quat QS[MAXDEG], DQS[MAXDEG], PPRE[MAXDEG + 1], SSUF[MAXDEG + 1];
 static mpfr_t W1[3], W2[3], W3[3], W4[3], W5[3], W6[3];
 
-static void mp_init_all(void)
+/* big per-edge/per-vertex arrays are initialized lazily up to the
+   sizes actually parsed (A_BUF/M_BUF are MAXE x MAXE static -- at
+   MAXV 2048 initializing them in full would allocate GBs and take
+   minutes; untouched static pages cost nothing). Monotone: batch
+   inputs of growing size extend the initialized region. */
+static int INITED_E = 0, INITED_V = 0;
+
+static void mp_init_upto(int ne, int nv)
 {
-    for (int e = 0; e < MAXE; e++) {
+    if (ne > MAXE) ne = MAXE;
+    if (nv > MAXV) nv = MAXV;
+    if (!A_BUF) {
+        A_BUF = calloc((size_t)MAXE * MAXE, sizeof(mpfr_t));
+        M_BUF = calloc((size_t)MAXE * MAXE, sizeof(mpfr_t));
+        if (!A_BUF || !M_BUF) { fprintf(stderr, "alloc failed\n"); exit(1); }
+    }
+    for (int e = INITED_E; e < ne; e++) {
         mpfr_init2(BEND[e], PREC); mpfr_init2(BEND_T[e], PREC);
         mpfr_init2(G_BUF[e], PREC); mpfr_init2(D_BUF[e], PREC); mpfr_init2(DELTA[e], PREC);
         for (int k = 0; k < 6; k++) mpfr_init2(JCOL[e][k], PREC);
     }
-    for (int i = 0; i < 3 * MAXV; i++) { mpfr_init2(R_BUF[i], PREC); mpfr_init2(RT_BUF[i], PREC); }
-    for (int p = 0; p < MAXE; p++)
-        for (int q = 0; q < MAXE; q++) { mpfr_init2(A_BUF[p][q], PREC); mpfr_init2(M_BUF[p][q], PREC); }
-    for (int v = 0; v <= MAXV; v++)
+    /* A_BUF/M_BUF: new rows in full, then new columns of old rows */
+    for (int p = INITED_E; p < ne; p++)
+        for (int q = 0; q < ne; q++) { mpfr_init2(A_BUF[p][q], PREC); mpfr_init2(M_BUF[p][q], PREC); }
+    for (int p = 0; p < INITED_E; p++)
+        for (int q = INITED_E; q < ne; q++) { mpfr_init2(A_BUF[p][q], PREC); mpfr_init2(M_BUF[p][q], PREC); }
+    for (int i = 3 * INITED_V; i < 3 * nv; i++) { mpfr_init2(R_BUF[i], PREC); mpfr_init2(RT_BUF[i], PREC); }
+    for (int v = (INITED_V ? INITED_V + 1 : 0); v <= nv; v++)
         for (int k = 0; k < 3; k++) mpfr_init2(VXYZ[v][k], PREC);
+    if (ne > INITED_E) INITED_E = ne;
+    if (nv > INITED_V) INITED_V = nv;
+}
+
+static void mp_init_all(void)
+{
     mpfr_inits2(PREC, ALPHA, T1, T2, T3, T4, NORM, NTRIAL, LAMBDA, TOL, (mpfr_ptr)0);
     for (int k = 0; k < 4; k++) {
         mpfr_init2(QTMP1[k], PREC); mpfr_init2(QTMP2[k], PREC);
@@ -665,8 +692,32 @@ static int ACT[MAXV], NACT;                /* active vertices */
 static int FIDX[MAXE];                     /* edge -> fold index, -1 */
 static mpfr_t R2[NRMAX], G2[MAXP], DX2[MAXP];
 static mpfr_t JB[MAXE][2][4][2];           /* fold e, endpoint side, comp, d{c,s} */
-static mpfr_t A2[MAXP][MAXP], C2[MAXP][MAXP], B2[MAXP][MAXP];
-static double JD[NRMAX][MAXP];
+static mpfr_t (*A2)[MAXP], (*C2)[MAXP], (*B2)[MAXP];  /* heap: MAXP^2
+   statics would put ~15GB in BSS at MAXV 2048 (ADRP range error);
+   allocated on demand, pages touched lazily */
+static double (*JD)[MAXP];
+static int CERT_INITED_P = 0;
+
+static void cert_init_upto(int np)
+{
+    if (np > MAXP) np = MAXP;
+    if (!A2) {
+        A2 = calloc((size_t)MAXP * MAXP, sizeof(mpfr_t));
+        C2 = calloc((size_t)MAXP * MAXP, sizeof(mpfr_t));
+        B2 = calloc((size_t)MAXP * MAXP, sizeof(mpfr_t));
+        JD = calloc((size_t)NRMAX * MAXP, sizeof(double));
+        if (!A2 || !C2 || !B2 || !JD) { fprintf(stderr, "cert alloc failed\n"); exit(1); }
+    }
+    for (int i = CERT_INITED_P; i < np; i++)
+        for (int j = 0; j < np; j++) {
+            mpfr_init2(A2[i][j], PREC); mpfr_init2(C2[i][j], PREC); mpfr_init2(B2[i][j], PREC);
+        }
+    for (int i = 0; i < CERT_INITED_P; i++)
+        for (int j = CERT_INITED_P; j < np; j++) {
+            mpfr_init2(A2[i][j], PREC); mpfr_init2(C2[i][j], PREC); mpfr_init2(B2[i][j], PREC);
+        }
+    if (np > CERT_INITED_P) CERT_INITED_P = np;
+}
 static int SEL[MAXP], INSEL[NRMAX];
 static mpfr_t T60Q[4], QA[4], QB[4], QC[4];
 static mpfr_t PRE[2 * MAXDEG + 2][4], SUF[2 * MAXDEG + 2][4];
@@ -682,10 +733,6 @@ static void cert_init_all(void)
     }
     for (int i = 0; i < NRMAX; i++) mpfr_init2(R2[i], PREC);
     for (int i = 0; i < MAXP; i++) { mpfr_init2(G2[i], PREC); mpfr_init2(DX2[i], PREC); }
-    for (int i = 0; i < MAXP; i++)
-        for (int j = 0; j < MAXP; j++) {
-            mpfr_init2(A2[i][j], PREC); mpfr_init2(C2[i][j], PREC); mpfr_init2(B2[i][j], PREC);
-        }
     for (int k = 0; k < 4; k++) {
         mpfr_init2(T60Q[k], PREC); mpfr_init2(QA[k], PREC);
         mpfr_init2(QB[k], PREC); mpfr_init2(QC[k], PREC);
@@ -1195,6 +1242,8 @@ static int solve_one_netcode(const char *netcode, const char *name,
     if (errmsgsize > 0) errmsg[0] = '\0';
     if (parse_netcode(netcode) <= 0) { snprintf(errmsg, errmsgsize, "parse failed"); return 1; }
     if (build_topology() < 0) { snprintf(errmsg, errmsgsize, "build_topology failed"); return 1; }
+    mp_init_upto(NE, NV);
+    cert_init_upto(2 * NE);
     if (parse_flats(FLATS_STR) < 0) { snprintf(errmsg, errmsgsize, "bad --flats"); return 1; }
     if (parse_dents(DENTS_STR) < 0) { snprintf(errmsg, errmsgsize, "bad --dents"); return 1; }
     if (wish_init_double(wish) < 0) { snprintf(errmsg, errmsgsize, "wish_init failed"); return 1; }
