@@ -64,6 +64,8 @@ static int NDENTREQ = 0;
 static int DENTS_EXACT = 0;            /* --dents-exact: T<0 on listed, T>=0 off */
 static int BENDS_ONLY = 0;             /* omit v/f lines from output */
 static int PROVE = 0;                  /* solve, classify, refreeze, certify */
+static int WALK = 0;                   /* --walk: rung-ladder fallback (G1 2026-07-21) */
+static int WALK_FOOT = 0;              /* 0 = direct; else foothold rung in decidegrees */
 static int USE_SPARSE = 1;             /* fixed-pattern sparse Cholesky is the
                                           default; --dense restores the dense path
                                           (same pivot order, same operand order:
@@ -972,6 +974,19 @@ static void set_step_quat(void)
     mpfr_sin(T60Q[3], CT1, MPFR_RNDN);
 }
 
+/* G1 2026-07-21: one path for changing alpha mid-run (--walk rungs).
+   Updates ALPHA_DEG, ALPHA, and the cert step quaternion when the
+   cert buffers exist. Must be called with the target alpha before
+   the freeze ladder / certificate / record stages. */
+static void set_alpha_deg(double deg)
+{
+    ALPHA_DEG = deg;
+    mpfr_const_pi(ALPHA, MPFR_RNDN);
+    mpfr_mul_d(ALPHA, ALPHA, ALPHA_DEG, MPFR_RNDN);
+    mpfr_div_ui(ALPHA, ALPHA, 180, MPFR_RNDN);
+    if (PROVE) set_step_quat();
+}
+
 static void pair_word(int v, mpfr_t q[4])
 {
     mpfr_set_ui(q[0], 1, MPFR_RNDN);
@@ -1377,6 +1392,9 @@ static int write_prove_record(FILE *fp, const char *name, const char *netcode)
     fprintf(fp, "net %s\nv %d\ne %d\nunit halfturns\n", name, NV, NE);
     if (ALPHA_DEG != 60.0)
         fprintf(fp, "alpha %.17g degrees\n", ALPHA_DEG);
+    if (WALK)
+        fprintf(fp, WALK_FOOT ? "# route walk foothold=%.1f\n"
+                              : "# route direct\n", WALK_FOOT / 10.0);
     if (PANCAKE) {
         fprintf(fp, "benderr 0\n");
         fprintf(fp, "faces %s\n", netcode);
@@ -1471,14 +1489,46 @@ static int solve_one_netcode(const char *netcode, const char *name,
     if (SEED_PATH && load_seed(SEED_PATH) < 0) {
         snprintf(errmsg, errmsgsize, "bad --seed"); return 1;
     }
-    mpfr_const_pi(ALPHA, MPFR_RNDN);
-    mpfr_mul_d(ALPHA, ALPHA, ALPHA_DEG, MPFR_RNDN);
-    mpfr_div_ui(ALPHA, ALPHA, 180, MPFR_RNDN);
-    if (PROVE) set_step_quat();       /* cert buffers exist only under --prove */
+    {
+        double a0 = ALPHA_DEG;
+        set_alpha_deg(a0);            /* same ops as before; cert quat under --prove */
+    }
     /* tol = 2^(-3*prec/4): ~1e-29 at 128 bits */
     mpfr_set_ui(TOL, 1, MPFR_RNDN);
     mpfr_div_2ui(TOL, TOL, (unsigned long)(3 * PREC / 4), MPFR_RNDN);
-    if (lm_solve(200) < 0) { snprintf(errmsg, errmsgsize, "LM did not converge"); return 1; }
+    WALK_FOOT = 0;
+    if (lm_solve(200) < 0) {
+        if (!WALK) { snprintf(errmsg, errmsgsize, "LM did not converge"); return 1; }
+        /* --walk (G1 2026-07-21): gated rung-ladder fallback, entirely
+           before the freeze ladder. Descend to the highest seedless
+           foothold, then gated hops back up carrying only BEND. Foothold
+           resets restore the wish start (explicit --flats stay pinned;
+           IS_FLAT/FREE_E untouched at this stage). No randomization. */
+        static const double RUNGS[4] = { 59.9, 59.0, 57.0, 54.0 };
+        double target = ALPHA_DEG;
+        double lad[4];
+        int nr = 0, foot = -1;
+        for (int i = 0; i < 4; i++)
+            if (RUNGS[i] < target) lad[nr++] = RUNGS[i];
+        for (int i = 0; i < nr && foot < 0; i++) {
+            for (int e = 0; e < NE; e++)
+                mpfr_set_d(BEND[e], IS_FLAT[e] ? 0.0 : wish[e], MPFR_RNDN);
+            set_alpha_deg(lad[i]);
+            if (lm_solve(200) == 0) foot = i;
+        }
+        int ok = (foot >= 0);
+        for (int i = foot - 1; ok && i >= 0; i--) {
+            set_alpha_deg(lad[i]);
+            ok = (lm_solve(200) == 0);
+        }
+        if (ok) { set_alpha_deg(target); ok = (lm_solve(200) == 0); }
+        if (!ok) {
+            set_alpha_deg(target);
+            snprintf(errmsg, errmsgsize, "LM did not converge (walk failed)");
+            return 1;
+        }
+        WALK_FOOT = (int)(lad[foot] * 10 + 0.5);
+    }
     if (PROVE) {
         /* pancake pattern: every bend within tol of 0 or +-gem/2 -> pin all
            exactly, no certificate needed (exact by construction) */
@@ -1592,6 +1642,8 @@ int main(int argc, char **argv)
             USE_SPARSE = 1; argi += 1;    /* default; kept for compatibility */
         } else if (strcmp(argv[argi], "--dense") == 0) {
             USE_SPARSE = 0; argi += 1;
+        } else if (strcmp(argv[argi], "--walk") == 0) {
+            WALK = 1; argi += 1;
         } else if (strcmp(argv[argi], "--nogate") == 0) {
             NOGATE = 1; argi += 1;
         } else if (strcmp(argv[argi], "--alpha") == 0) {
@@ -1650,6 +1702,6 @@ int main(int argc, char **argv)
         free(line);
         return fails ? 1 : 0;
     }
-    fprintf(stderr, "usage: %s [--prec BITS] [--flats \"a,b;c,d\"] [--seed FILE] [--dense] NETCODE | --batch < netcodes\n", argv[0]);
+    fprintf(stderr, "usage: %s [--prec BITS] [--flats \"a,b;c,d\"] [--seed FILE] [--dense] [--walk] NETCODE | --batch < netcodes\n", argv[0]);
     return 2;
 }

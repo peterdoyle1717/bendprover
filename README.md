@@ -28,7 +28,10 @@ fixed-pattern sparse Cholesky (natural pivot order) by default;
 the same mpfr operations in the same order on the nonzero pattern,
 skipping only operations whose operands are structural zeros, and is
 byte-identity-swept against `--dense` (full `--prove` transcripts) on
-the validation corpus before each change of default.
+the validation corpus before each change of default.  `--walk` adds a
+gated rung-ladder fallback (59.9/59/57/54, within-member seeding
+only, no randomization) for nets whose direct hopestart solve dies at
+the dent gate; the record then carries a `# route` comment.
     echo 'CCAE 1,2,3;1,3,4;1,4,2;2,4,3' | csrc/euclid_lm_mp --prove --batch
 
 Batch lines are `NAME NETCODE` (name optional). `run/doob_prove.sh`
