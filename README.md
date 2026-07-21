@@ -21,6 +21,14 @@ all-integer with `benderr 0`), decimals certified within the record's
 ## Build and run
 
     make euclid_lm_mp          # needs mpfr + gmp
+
+Linear algebra: the LM normal equations are factored by a
+fixed-pattern sparse Cholesky (natural pivot order) by default;
+`--dense` restores the previous dense path.  The sparse path performs
+the same mpfr operations in the same order on the nonzero pattern,
+skipping only operations whose operands are structural zeros, and is
+byte-identity-swept against `--dense` (full `--prove` transcripts) on
+the validation corpus before each change of default.
     echo 'CCAE 1,2,3;1,3,4;1,4,2;2,4,3' | csrc/euclid_lm_mp --prove --batch
 
 Batch lines are `NAME NETCODE` (name optional). `run/doob_prove.sh`

@@ -64,6 +64,10 @@ static int NDENTREQ = 0;
 static int DENTS_EXACT = 0;            /* --dents-exact: T<0 on listed, T>=0 off */
 static int BENDS_ONLY = 0;             /* omit v/f lines from output */
 static int PROVE = 0;                  /* solve, classify, refreeze, certify */
+static int USE_SPARSE = 1;             /* fixed-pattern sparse Cholesky is the
+                                          default; --dense restores the dense path
+                                          (same pivot order, same operand order:
+                                          the two are byte-identity-swept) */
 static double PROVE_FLAT_TOL = 1e-8;
 static int IS_PI[MAXE];                /* pancake case: edges pinned at gem/2 */
 static int PANCAKE = 0;
@@ -217,7 +221,7 @@ static void mp_init_upto(int ne, int nv)
 {
     if (ne > MAXE) ne = MAXE;
     if (nv > MAXV) nv = MAXV;
-    if (!A_BUF) {
+    if (!A_BUF && !USE_SPARSE) {
         A_BUF = calloc((size_t)MAXE * MAXE, sizeof(mpfr_t));
         M_BUF = calloc((size_t)MAXE * MAXE, sizeof(mpfr_t));
         if (!A_BUF || !M_BUF) { fprintf(stderr, "alloc failed\n"); exit(1); }
@@ -228,10 +232,12 @@ static void mp_init_upto(int ne, int nv)
         for (int k = 0; k < 6; k++) mpfr_init2(JCOL[e][k], PREC);
     }
     /* A_BUF/M_BUF: new rows in full, then new columns of old rows */
-    for (int p = INITED_E; p < ne; p++)
-        for (int q = 0; q < ne; q++) { mpfr_init2(A_BUF[p][q], PREC); mpfr_init2(M_BUF[p][q], PREC); }
-    for (int p = 0; p < INITED_E; p++)
-        for (int q = INITED_E; q < ne; q++) { mpfr_init2(A_BUF[p][q], PREC); mpfr_init2(M_BUF[p][q], PREC); }
+    if (!USE_SPARSE) {
+        for (int p = INITED_E; p < ne; p++)
+            for (int q = 0; q < ne; q++) { mpfr_init2(A_BUF[p][q], PREC); mpfr_init2(M_BUF[p][q], PREC); }
+        for (int p = 0; p < INITED_E; p++)
+            for (int q = INITED_E; q < ne; q++) { mpfr_init2(A_BUF[p][q], PREC); mpfr_init2(M_BUF[p][q], PREC); }
+    }
     for (int i = 3 * INITED_V; i < 3 * nv; i++) { mpfr_init2(R_BUF[i], PREC); mpfr_init2(RT_BUF[i], PREC); }
     for (int v = (INITED_V ? INITED_V + 1 : 0); v <= nv; v++)
         for (int k = 0; k < 3; k++) mpfr_init2(VXYZ[v][k], PREC);
@@ -362,10 +368,208 @@ static void jacobian_cols(mpfr_t *bend)
     }
 }
 
+/* ================= sparse fixed-pattern Cholesky path =================
+ * --sparse: same pivot order (natural), same per-entry k-accumulation
+ * order as the dense chol_solve_neg below.  Every operation skipped is
+ * one whose dense operands are structural zeros, which in mpfr are
+ * exact 0.0 (mul by exact 0 gives exact 0; subtracting exact 0 is
+ * exact), so no computed value can differ: the factor, the solves, and
+ * hence the LM iterates are bit-identical to the dense path.  The only
+ * change that would break bit-identity is pivot reordering, which this
+ * stage does not do.  Pattern = free-edge adjacency (columns overlap
+ * iff edges share an endpoint; see normal_matrix) plus symbolic fill
+ * in natural order; rebuilt whenever NFREE/FREE_E change (freeze
+ * ladder rungs). */
+static int SP_N = -1;                     /* pattern built for this NFREE */
+static int SP_FREE_SIG[MAXE];             /* FREE_E copy at build time */
+static int *SPR_PTR, *SPR_COL;            /* strict lower rows: i -> cols k<i asc */
+static int *SPC_PTR, *SPC_ROW, *SPC_SLOT; /* strict lower cols: j -> rows i>j asc */
+static mpfr_t *SPA_V, *SPM_V;             /* values on the row slots */
+static mpfr_t *SPA_D, *SPM_D;             /* diagonals */
+static int SP_NNZ = 0, SP_MP_SLOTS = 0, SP_MP_DIAG = 0;
+
+static void sparse_build_pattern(void)
+{
+    int n = NFREE;
+    int words = (n + 63) / 64;
+    unsigned long long *col = calloc((size_t)n * words, sizeof(*col));
+    int *efree = malloc(sizeof(int) * (MAXE + 1));
+    if (!col || !efree) { fprintf(stderr, "sparse alloc failed\n"); exit(1); }
+    for (int e = 0; e < NE; e++) efree[e] = -1;
+    for (int pf = 0; pf < n; pf++) efree[FREE_E[pf]] = pf;
+    /* A-pattern: free edges sharing a vertex */
+    for (int v = 1; v <= NV; v++)
+        for (int s = 0; s < FLOWER_LEN[v]; s++) {
+            int pf = efree[FLOWER_E[v][s]];
+            if (pf < 0) continue;
+            for (int t = s + 1; t < FLOWER_LEN[v]; t++) {
+                int qf = efree[FLOWER_E[v][t]];
+                if (qf < 0) continue;
+                int lo = pf < qf ? pf : qf, hi = pf < qf ? qf : pf;
+                col[(size_t)lo * words + hi / 64] |= 1ULL << (hi % 64);
+            }
+        }
+    /* symbolic fill, natural order */
+    for (int k = 0; k < n; k++) {
+        unsigned long long *ck = col + (size_t)k * words;
+        int p = -1;
+        for (int w = k / 64; w < words && p < 0; w++)
+            if (ck[w]) {
+                unsigned long long m = ck[w];
+                if (w == k / 64) m &= ~((k % 64 == 63) ? 0ULL : ((1ULL << (k % 64 + 1)) - 1));
+                if (m) p = w * 64 + __builtin_ctzll(m);
+            }
+        if (p < 0) continue;
+        unsigned long long *cp = col + (size_t)p * words;
+        for (int w = 0; w < words; w++) cp[w] |= ck[w];
+        cp[p / 64] &= ~(1ULL << (p % 64));
+    }
+    /* row/col lists (append in k-ascending scan => sorted) */
+    free(SPR_PTR); free(SPR_COL); free(SPC_PTR); free(SPC_ROW); free(SPC_SLOT);
+    int *rcnt = calloc(n + 1, sizeof(int));
+    int nnz = 0;
+    for (int k = 0; k < n; k++) {
+        unsigned long long *ck = col + (size_t)k * words;
+        for (int w = 0; w < words; w++)
+            for (unsigned long long m = ck[w]; m; m &= m - 1) {
+                int i = w * 64 + __builtin_ctzll(m);
+                if (i > k) { rcnt[i]++; nnz++; }
+            }
+    }
+    SPR_PTR = malloc(sizeof(int) * (n + 1)); SPR_COL = malloc(sizeof(int) * (nnz ? nnz : 1));
+    SPC_PTR = malloc(sizeof(int) * (n + 1)); SPC_ROW = malloc(sizeof(int) * (nnz ? nnz : 1));
+    SPC_SLOT = malloc(sizeof(int) * (nnz ? nnz : 1));
+    if (!SPR_PTR || !SPR_COL || !SPC_PTR || !SPC_ROW || !SPC_SLOT) { fprintf(stderr, "sparse alloc failed\n"); exit(1); }
+    SPR_PTR[0] = 0;
+    for (int i = 0; i < n; i++) SPR_PTR[i + 1] = SPR_PTR[i] + rcnt[i];
+    int *rfill = calloc(n, sizeof(int));
+    int *ccnt = calloc(n + 1, sizeof(int));
+    for (int k = 0; k < n; k++) {                /* k asc => each row's cols asc */
+        unsigned long long *ck = col + (size_t)k * words;
+        for (int w = 0; w < words; w++)
+            for (unsigned long long m = ck[w]; m; m &= m - 1) {
+                int i = w * 64 + __builtin_ctzll(m);
+                if (i > k) { SPR_COL[SPR_PTR[i] + rfill[i]++] = k; ccnt[k]++; }
+            }
+    }
+    SPC_PTR[0] = 0;
+    for (int k = 0; k < n; k++) SPC_PTR[k + 1] = SPC_PTR[k] + ccnt[k];
+    int *cfill = calloc(n, sizeof(int));
+    for (int i = 0; i < n; i++)                  /* i asc => each col's rows asc */
+        for (int s = SPR_PTR[i]; s < SPR_PTR[i + 1]; s++) {
+            int k = SPR_COL[s];
+            int c = SPC_PTR[k] + cfill[k]++;
+            SPC_ROW[c] = i; SPC_SLOT[c] = s;
+        }
+    free(col); free(efree); free(rcnt); free(rfill); free(ccnt); free(cfill);
+    /* mpfr slots: grow-only */
+    if (!SPA_V) {
+        SPA_V = calloc(MAXE * 32, sizeof(mpfr_t)); SPM_V = calloc(MAXE * 32, sizeof(mpfr_t));
+        SPA_D = calloc(MAXE, sizeof(mpfr_t)); SPM_D = calloc(MAXE, sizeof(mpfr_t));
+        if (!SPA_V || !SPM_V || !SPA_D || !SPM_D) { fprintf(stderr, "sparse alloc failed\n"); exit(1); }
+    }
+    if (nnz > MAXE * 32) { fprintf(stderr, "sparse fill %d exceeds slot cap %d\n", nnz, MAXE * 32); exit(1); }
+    for (int s = SP_MP_SLOTS; s < nnz; s++) { mpfr_init2(SPA_V[s], PREC); mpfr_init2(SPM_V[s], PREC); }
+    if (nnz > SP_MP_SLOTS) SP_MP_SLOTS = nnz;
+    for (int i = SP_MP_DIAG; i < n; i++) { mpfr_init2(SPA_D[i], PREC); mpfr_init2(SPM_D[i], PREC); }
+    if (n > SP_MP_DIAG) SP_MP_DIAG = n;
+    SP_NNZ = nnz;
+    SP_N = n;
+    memcpy(SP_FREE_SIG, FREE_E, sizeof(int) * n);
+}
+
+static void sparse_check_pattern(void)
+{
+    if (SP_N == NFREE && memcmp(SP_FREE_SIG, FREE_E, sizeof(int) * NFREE) == 0)
+        return;
+    sparse_build_pattern();
+}
+
+/* same per-entry operand order as normal_matrix: entry (i,j), i>j, is
+   the dense upper-triangle entry A[pf=j][qf=i] (then mirrored), so the
+   sp/sq endpoint loops run with p = FREE_E[j], q = FREE_E[i]. */
+static void sparse_entry(mpfr_t dst, int p, int q)
+{
+    mpfr_set_ui(dst, 0, MPFR_RNDN);
+    for (int sp = 0; sp < 2; sp++) {
+        int vp = sp ? EDGE_B[p] : EDGE_A[p];
+        for (int sq = 0; sq < 2; sq++) {
+            int vq = sq ? EDGE_B[q] : EDGE_A[q];
+            if (vp != vq) continue;
+            for (int c = 0; c < 3; c++) {
+                mpfr_mul(T1, JCOL[p][3 * sp + c], JCOL[q][3 * sq + c], MPFR_RNDN);
+                mpfr_add(dst, dst, T1, MPFR_RNDN);
+            }
+        }
+    }
+}
+
+static void normal_matrix_sparse(void)
+{
+    sparse_check_pattern();
+    for (int i = 0; i < SP_N; i++) {
+        sparse_entry(SPA_D[i], FREE_E[i], FREE_E[i]);
+        for (int s = SPR_PTR[i]; s < SPR_PTR[i + 1]; s++)
+            sparse_entry(SPA_V[s], FREE_E[SPR_COL[s]], FREE_E[i]);
+    }
+}
+
+static int chol_solve_neg_sparse(void)
+{
+    int n = SP_N;
+    for (int i = 0; i < n; i++) {
+        mpfr_set(SPM_D[i], SPA_D[i], MPFR_RNDN);
+        mpfr_mul(T1, LAMBDA, D_BUF[i], MPFR_RNDN);
+        mpfr_add(SPM_D[i], SPM_D[i], T1, MPFR_RNDN);
+    }
+    for (int s = 0; s < SP_NNZ; s++) mpfr_set(SPM_V[s], SPA_V[s], MPFR_RNDN);
+    for (int j = 0; j < n; j++) {
+        for (int s = SPR_PTR[j]; s < SPR_PTR[j + 1]; s++) {
+            mpfr_mul(T1, SPM_V[s], SPM_V[s], MPFR_RNDN);
+            mpfr_sub(SPM_D[j], SPM_D[j], T1, MPFR_RNDN);
+        }
+        if (mpfr_sgn(SPM_D[j]) <= 0) return -1;
+        mpfr_sqrt(SPM_D[j], SPM_D[j], MPFR_RNDN);
+        for (int c = SPC_PTR[j]; c < SPC_PTR[j + 1]; c++) {
+            int i = SPC_ROW[c], sij = SPC_SLOT[c];
+            int a = SPR_PTR[i], ae = SPR_PTR[i + 1];
+            int b = SPR_PTR[j], be = SPR_PTR[j + 1];
+            while (a < ae && b < be) {           /* merge: k ascending */
+                int ka = SPR_COL[a], kb = SPR_COL[b];
+                if (ka == kb) {
+                    mpfr_mul(T1, SPM_V[a], SPM_V[b], MPFR_RNDN);
+                    mpfr_sub(SPM_V[sij], SPM_V[sij], T1, MPFR_RNDN);
+                    a++; b++;
+                } else if (ka < kb) a++;
+                else b++;
+            }
+            mpfr_div(SPM_V[sij], SPM_V[sij], SPM_D[j], MPFR_RNDN);
+        }
+    }
+    for (int i = 0; i < n; i++) {                /* forward: L y = -g */
+        mpfr_neg(DELTA[i], G_BUF[i], MPFR_RNDN);
+        for (int s = SPR_PTR[i]; s < SPR_PTR[i + 1]; s++) {
+            mpfr_mul(T1, SPM_V[s], DELTA[SPR_COL[s]], MPFR_RNDN);
+            mpfr_sub(DELTA[i], DELTA[i], T1, MPFR_RNDN);
+        }
+        mpfr_div(DELTA[i], DELTA[i], SPM_D[i], MPFR_RNDN);
+    }
+    for (int i = n - 1; i >= 0; i--) {           /* back: L^T x = y */
+        for (int c = SPC_PTR[i]; c < SPC_PTR[i + 1]; c++) {
+            mpfr_mul(T1, SPM_V[SPC_SLOT[c]], DELTA[SPC_ROW[c]], MPFR_RNDN);
+            mpfr_sub(DELTA[i], DELTA[i], T1, MPFR_RNDN);
+        }
+        mpfr_div(DELTA[i], DELTA[i], SPM_D[i], MPFR_RNDN);
+    }
+    return 0;
+}
+/* =============== end sparse fixed-pattern Cholesky path =============== */
+
 /* normal matrix A = J^T J via shared rows: columns p, q overlap only on
    rows of shared endpoint vertices. */
 static void normal_matrix(void)
 {
+    if (USE_SPARSE) { normal_matrix_sparse(); return; }
     for (int pf = 0; pf < NFREE; pf++)
         for (int qf = pf; qf < NFREE; qf++) mpfr_set_ui(A_BUF[pf][qf], 0, MPFR_RNDN);
 
@@ -409,6 +613,7 @@ static void grad_vec(mpfr_t *r)
    pivot is nonpositive (raise lambda, like dgesv info != 0). */
 static int chol_solve_neg(void)
 {
+    if (USE_SPARSE) return chol_solve_neg_sparse();
     int n = NFREE;
     for (int i = 0; i < n; i++) {
         for (int j = i; j < n; j++) mpfr_set(M_BUF[j][i], A_BUF[j][i], MPFR_RNDN);
@@ -507,6 +712,8 @@ static int LM_ITERS = 0;
 
 static int lm_solve(int maxiter)
 {
+    /* diagnostic veto counters (stderr only; stdout unchanged) */
+    int dg_gate = 0, dg_gate_only = 0, dg_norm = 0, dg_chol = 0, dg_lastv = 0;
     int rows = 3 * NV;
     mpfr_set_d(LAMBDA, 1.0, MPFR_RNDN);
 
@@ -520,13 +727,15 @@ static int lm_solve(int maxiter)
         jacobian_cols(BEND);
         normal_matrix();
         grad_vec(R_BUF);
-        for (int pf = 0; pf < NFREE; pf++) mpfr_set(D_BUF[pf], A_BUF[pf][pf], MPFR_RNDN);
+        for (int pf = 0; pf < NFREE; pf++)
+            mpfr_set(D_BUF[pf], USE_SPARSE ? SPA_D[pf] : A_BUF[pf][pf], MPFR_RNDN);
 
         int accepted = 0;
         for (int retry = 0; retry < 20; retry++) {
             if (chol_solve_neg() != 0) {
+                dg_chol++;
                 mpfr_mul_ui(LAMBDA, LAMBDA, 10, MPFR_RNDN);
-                if (mpfr_cmp_d(LAMBDA, 1e12) > 0) return -1;
+                if (mpfr_cmp_d(LAMBDA, 1e12) > 0) goto diag_fail;
                 continue;
             }
             for (int e = 0; e < NE; e++) mpfr_set(BEND_T[e], BEND[e], MPFR_RNDN);
@@ -539,6 +748,9 @@ static int lm_solve(int maxiter)
             residual(BEND_T, RT_BUF);
             vec_norm2(NTRIAL, RT_BUF, rows);
 
+            if (gate_bad) { dg_gate++; dg_lastv = gate_bad;
+                            if (mpfr_cmp(NTRIAL, NORM) < 0) dg_gate_only++; }
+            else if (mpfr_cmp(NTRIAL, NORM) >= 0) dg_norm++;
             if (mpfr_cmp(NTRIAL, NORM) < 0 && gate_bad == 0) {
                 for (int e = 0; e < NE; e++) mpfr_set(BEND[e], BEND_T[e], MPFR_RNDN);
                 for (int i = 0; i < rows; i++) mpfr_set(R_BUF[i], RT_BUF[i], MPFR_RNDN);
@@ -549,11 +761,18 @@ static int lm_solve(int maxiter)
                 break;
             }
             mpfr_mul_ui(LAMBDA, LAMBDA, 10, MPFR_RNDN);
-            if (mpfr_cmp_d(LAMBDA, 1e12) > 0) return -1;
+            if (mpfr_cmp_d(LAMBDA, 1e12) > 0) goto diag_fail;
         }
-        if (!accepted) return -1;
+        if (!accepted) goto diag_fail;
     }
-    return (mpfr_cmp(NORM, TOL) <= 0) ? 0 : -1;
+    if (mpfr_cmp(NORM, TOL) <= 0) return 0;
+diag_fail:
+    fprintf(stderr, "# lm_diag fail: it=%d norm=%.3e lambda=%.3e "
+            "gate_vetoes=%d (would_have_accepted=%d) norm_vetoes=%d "
+            "chol_fails=%d last_gate_vertex=%d\n",
+            LM_ITERS, mpfr_get_d(NORM, MPFR_RNDN), mpfr_get_d(LAMBDA, MPFR_RNDN),
+            dg_gate, dg_gate_only, dg_norm, dg_chol, dg_lastv);
+    return -1;
 }
 
 /* ---------------- realize (MPFR) ---------------- */
@@ -1369,6 +1588,10 @@ int main(int argc, char **argv)
             FLATS_STR = argv[argi + 1]; argi += 2;
         } else if (strcmp(argv[argi], "--seed") == 0) {
             SEED_PATH = argv[argi + 1]; argi += 2;
+        } else if (strcmp(argv[argi], "--sparse") == 0) {
+            USE_SPARSE = 1; argi += 1;    /* default; kept for compatibility */
+        } else if (strcmp(argv[argi], "--dense") == 0) {
+            USE_SPARSE = 0; argi += 1;
         } else if (strcmp(argv[argi], "--nogate") == 0) {
             NOGATE = 1; argi += 1;
         } else if (strcmp(argv[argi], "--alpha") == 0) {
@@ -1427,6 +1650,6 @@ int main(int argc, char **argv)
         free(line);
         return fails ? 1 : 0;
     }
-    fprintf(stderr, "usage: %s [--prec BITS] [--flats \"a,b;c,d\"] [--seed FILE] NETCODE | --batch < netcodes\n", argv[0]);
+    fprintf(stderr, "usage: %s [--prec BITS] [--flats \"a,b;c,d\"] [--seed FILE] [--dense] NETCODE | --batch < netcodes\n", argv[0]);
     return 2;
 }
